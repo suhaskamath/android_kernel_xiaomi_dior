@@ -38,51 +38,6 @@
 #include <media/radio-iris.h>
 #include <asm/unaligned.h>
 
-const unsigned char MIN_TX_TONE_VAL = 0x00;
-const unsigned char MAX_TX_TONE_VAL = 0x07;
-const unsigned char MIN_HARD_MUTE_VAL = 0x00;
-const unsigned char MAX_HARD_MUTE_VAL = 0x03;
-const unsigned char MIN_SRCH_MODE = 0x00;
-const unsigned char MAX_SRCH_MODE = 0x01;
-const unsigned char MIN_SCAN_DWELL = 0x00;
-const unsigned char MAX_SCAN_DWELL = 0x0F;
-const unsigned char MIN_SIG_TH = 0x00;
-const unsigned char MAX_SIG_TH = 0x03;
-const unsigned char MIN_PTY = 0X00;
-const unsigned char MAX_PTY = 0x1F;
-const unsigned short MIN_PI = 0x0000;
-const unsigned short MAX_PI = 0xFFFF;
-const unsigned char MIN_SRCH_STATIONS_CNT = 0x00;
-const unsigned char MAX_SRCH_STATIONS_CNT = 0x14;
-const unsigned char MIN_CHAN_SPACING = 0x00;
-const unsigned char MAX_CHAN_SPACING = 0x02;
-const unsigned char MIN_EMPHASIS = 0x00;
-const unsigned char MAX_EMPHASIS = 0x01;
-const unsigned char MIN_RDS_STD = 0x00;
-const unsigned char MAX_RDS_STD = 0x02;
-const unsigned char MIN_ANTENNA_VAL = 0x00;
-const unsigned char MAX_ANTENNA_VAL = 0x01;
-const unsigned char MIN_TX_PS_REPEAT_CNT = 0x01;
-const unsigned char MAX_TX_PS_REPEAT_CNT = 0x0F;
-const unsigned char MIN_SOFT_MUTE = 0x00;
-const unsigned char MAX_SOFT_MUTE = 0x01;
-const unsigned char MIN_PEEK_ACCESS_LEN = 0x01;
-const unsigned char MAX_PEEK_ACCESS_LEN = 0xF9;
-const unsigned char MIN_RESET_CNTR = 0x00;
-const unsigned char MAX_RESET_CNTR = 0x01;
-const unsigned char MIN_HLSI = 0x00;
-const unsigned char MAX_HLSI = 0x02;
-const unsigned char MIN_NOTCH_FILTER = 0x00;
-const unsigned char MAX_NOTCH_FILTER = 0x02;
-const unsigned char MIN_INTF_DET_OUT_LW_TH = 0x00;
-const unsigned char MAX_INTF_DET_OUT_LW_TH = 0xFF;
-const unsigned char MIN_INTF_DET_OUT_HG_TH = 0x00;
-const unsigned char MAX_INTF_DET_OUT_HG_TH = 0xFF;
-const signed char MIN_SINR_TH = -128;
-const signed char MAX_SINR_TH = 127;
-const unsigned char MIN_SINR_SAMPLES = 0x01;
-const unsigned char MAX_SINR_SAMPLES = 0xFF;
-
 static unsigned int rds_buf = 100;
 static int oda_agt;
 static int grp_mask;
@@ -96,7 +51,6 @@ static char rt_ert_flag;
 static char formatting_dir;
 static unsigned char sig_blend = CTRL_ON;
 static DEFINE_MUTEX(iris_fm);
-static int transport_ready = -1;
 
 module_param(rds_buf, uint, 0);
 MODULE_PARM_DESC(rds_buf, "RDS buffer entries: *100*");
@@ -1691,7 +1645,7 @@ static int hci_fm_set_cal_req_proc(struct radio_hci_dev *hdev,
 	opcode = hci_opcode_pack(HCI_OGF_FM_COMMON_CTRL_CMD_REQ,
 		HCI_OCF_FM_SET_CALIBRATION);
 	return radio_hci_send_cmd(hdev, opcode,
-		sizeof(hci_fm_set_cal_req_proc), cal_req);
+		sizeof(struct hci_fm_set_cal_req_proc), cal_req);
 }
 
 static int hci_fm_do_cal_req(struct radio_hci_dev *hdev,
@@ -3167,8 +3121,6 @@ static int iris_do_calibration(struct iris_device *radio)
 			radio->fm_hdev);
 	if (retval < 0)
 		FMDERR("Disable Failed after calibration %d", retval);
-	else
-		radio->mode = FM_OFF;
 
 	return retval;
 }
@@ -3505,9 +3457,8 @@ static int iris_vidioc_g_ctrl(struct file *file, void *priv,
 END:
 	if (retval > 0)
 		retval = -EINVAL;
-	if (retval < 0)
-		FMDERR("get control failed with %d, id: %d\n",
-			retval, ctrl->id);
+	if (ctrl != NULL && retval < 0)
+		FMDERR("get control failed: %d, ret: %d\n", ctrl->id, retval);
 
 	return retval;
 }
@@ -4928,7 +4879,7 @@ static int iris_fops_release(struct file *file)
 		return -EINVAL;
 
 	if (radio->mode == FM_OFF)
-		return 0;
+		goto END;
 
 	if (radio->mode == FM_RECV) {
 		radio->mode = FM_OFF;
@@ -4938,7 +4889,13 @@ static int iris_fops_release(struct file *file)
 		radio->mode = FM_OFF;
 		retval = hci_cmd(HCI_FM_DISABLE_TRANS_CMD,
 					radio->fm_hdev);
+	} else if (radio->mode == FM_CALIB) {
+		radio->mode = FM_OFF;
+		return retval;
 	}
+END:
+	if (radio->fm_hdev != NULL)
+		radio->fm_hdev->close_smd();
 	if (retval < 0)
 		FMDERR("Err on disable FM %d\n", retval);
 
@@ -5139,23 +5096,10 @@ static const struct v4l2_ioctl_ops iris_ioctl_ops = {
 	.vidioc_g_ext_ctrls           = iris_vidioc_g_ext_ctrls,
 };
 
-#ifndef MODULE
-extern int radio_hci_smd_init(void);
-static int iris_fops_open(struct file *f) {
-	if (transport_ready < 0) {
-		transport_ready = radio_hci_smd_init();
-	}
-	return transport_ready;
-}
-#endif
-
 static const struct v4l2_file_operations iris_fops = {
 	.owner = THIS_MODULE,
 	.unlocked_ioctl = video_ioctl2,
 	.release        = iris_fops_release,
-#ifndef MODULE
-	.open              = iris_fops_open,
-#endif
 };
 
 static struct video_device iris_viddev_template = {
