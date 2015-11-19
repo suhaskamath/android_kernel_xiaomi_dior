@@ -2339,3 +2339,4 @@ module_exit(mxt_cleanup);
 MODULE_AUTHOR("Iiro Valkonen");
 MODULE_DESCRIPTION("Driver for Atmel maXTouch Touchscreen Controller");
 MODULE_LICENSE("GPL");
+
