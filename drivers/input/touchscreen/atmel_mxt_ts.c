@@ -27,7 +27,7 @@
 #include <linux/gpio.h>
 #include <linux/string.h>
 #include <linux/of_gpio.h>
-
+#include <asm/bootinfo.h>
 
 /* Version */
 #define MXT_VER_20		20
@@ -90,6 +90,8 @@
 #define MXT_PROCI_GLOVEDETECTION_T78		78
 #define MXT_PROCI_RETRANSMISSIONCOMPENSATION_T80	80
 #define MXT_TOUCH_MULTI_T100		100
+#define MXT_SPT_SELFCAPHOVERCTECONFIG_T102	102
+#define MXT_SPT_AUXTOUCHCONFIG_T104	104
 
 /* MXT_GEN_MESSAGE_T5 object */
 #define MXT_RPTID_NOMSG		0xff
@@ -258,8 +260,9 @@
 #define MXT_DIAG_PAGE_UP	0x01
 #define MXT_DIAG_MULT_DELTA	0x10
 #define MXT_DIAG_MULT_REF	0x11
+#define MXT_DIAG_SELF_DELTA	0xFC
 #define MXT_DIAG_PAGE_SIZE	0x80
-#define MXT_DIAG_TOTAL_SIZE	0x2A0
+#define MXT_DIAG_TOTAL_SIZE	0x438
 #define MXT_DIAG_SELF_SIZE	0x5A
 
 /* MXT_SPT_USERDATA_T38 */
@@ -274,6 +277,16 @@
 
 /* MXT_PROCI_GLOVEDETECTION_T78 */
 #define MXT_GLOVE_CTRL		0x00
+
+/* MXT_SPT_SELFCAPHOVERCTECONFIG_T102 */
+#define MXT_SELF_CHGTIME	13
+#define MXT_SELF_RECALCFG	28
+
+/* MXT_SPT_AUXTOUCHCONFIG_T104 */
+#define MXT_AUXTCHCFG_XTCHTHR	2
+#define MXT_AUXTCHCFG_INTTHRX	4
+#define MXT_AUXTCHCFG_YTCHTHR	7
+#define MXT_AUXTCHCFG_INTTHRY	9
 
 /* Defines for Suspend/Resume */
 #define MXT_SUSPEND_STATIC      0
@@ -399,6 +412,7 @@
 #define MXT_GOLDSTS_FCALPASS		(1 << 6)
 #define MXT_GOLDSTS_FCALFAIL		(1 << 7)
 
+#define MXT_GOLD_USECURR	0x80
 #define MXT_GOLDCMD_NONE	0x00
 #define MXT_GOLDCMD_PRIME	0x04
 #define MXT_GOLDCMD_GENERATE	0x08
@@ -428,8 +442,20 @@
 #define MXT_NOICFG_VNOISY	(1 << 1)
 #define MXT_NOICFG_NOISY	(1 << 0)
 
+/* T102 self-cap */
+#define MXT_SELFCAP_CMD	0x1
+#define MXT_SELFCMD_TUNE	0x1
+#define MXT_SELFCMD_NVM_TUNE	0x2
+#define MXT_SELFCMD_RAM_TUNE	0x3
+#define MXT_SELFCMD_RAM_FINE	0x4
+#define MXT_SELFCMD_STORE	0x5
+#define MXT_SELFCMD_BG_TUNE	0x6
+#define MXT_SELFCAL_RECALHITHREN (1 << 6)
+#define MXT_SELFCAL_RECALLOTHREN (1 << 7)
+
 #define MXT_DEBUGFS_DIR		"atmel_mxt_ts"
 #define MXT_DEBUGFS_FILE		"object"
+
 
 #define MXT_INPUT_EVENT_START		0
 #define MXT_INPUT_EVENT_SENSITIVE_MODE_OFF		0
@@ -439,12 +465,6 @@
 #define MXT_INPUT_EVENT_END		3
 
 #define MXT_MAX_FINGER_NUM	10
-
-#define MXT_VTG_MIN_UV		2600000
-#define MXT_VTG_MAX_UV		3300000
-#define MXT_I2C_VTG_MIN_UV	1800000
-#define MXT_I2C_VTG_MAX_UV	1800000
-
 
 struct mxt_info {
 	u8 family_id;
@@ -486,6 +506,19 @@ struct mxt_golden_msg {
 	u8 fcalmaxdiffy;
 };
 
+
+struct mxt_selfcap_status {
+	u8 cause;
+	u8 error_code;
+};
+
+struct mxt_finger {
+	int x;
+	int y;
+	int state;
+	unsigned long jiffies_val;
+};
+
 struct mxt_mode_switch {
 	struct mxt_data *data;
 	u8 mode;
@@ -500,6 +533,7 @@ struct mxt_data {
 	enum mxt_device_state state;
 	struct mxt_object *object_table;
 	struct regulator *regulator_vdd;
+	struct regulator *regulator_avdd;
 	u16 mem_size;
 	struct mxt_info info;
 	unsigned int irq;
@@ -525,12 +559,40 @@ struct mxt_data {
 	u8 vendor_id;
 	int current_index;
 	u8 update_flag;
+	u8 gr_enable;
+	int golden_ok;
 	u8 test_result[6];
+	u8 selfthr_save;
+	u8 intthr_save;
+	struct mxt_finger finger;
+	struct mxt_finger finger_tracker[MXT_MAX_FINGER_NUM];
+	int land_signed;
 	int touch_num;
+	int self_restore_done;
+	u8 anti_calib[4];
 	u8 diag_mode;
 	u8 atchthr;
+	u8 self_recalib_para;
+	struct workqueue_struct* work_queue;
+	struct delayed_work update_setting_delayed_work;
+	struct delayed_work disable_anticalib_delayed_work;
+	struct work_struct pre_use_work;
 	u8 sensitive_mode;
-	int golden_ok;
+	u8 stylus_mode;
+	bool cal_in_progress;
+	bool is_recalib_available;
+	int safe_count;
+	int prev_status;
+	u16 ref_diff_threshold;
+	int *ignore_tx;
+	int *ignore_rx;
+	int ignore_tx_num;
+	int ignore_rx_num;
+	bool is_ignore_channel_saved;
+	bool init_complete;
+	bool use_last_golden;
+	struct mutex golden_mutex;
+
 
 	/* Slowscan parameters	*/
 	int slowscan_enabled;
@@ -541,6 +603,7 @@ struct mxt_data {
 	u8 slowscan_shad_idle_cycle_time;
 	u8 slowscan_shad_actv2idle_timeout;
 	struct mxt_golden_msg golden_msg;
+	struct mxt_selfcap_status selfcap_status;
 
 	/* Cached parameters from object table */
 	u16 T5_address;
@@ -565,9 +628,12 @@ struct mxt_data {
 	u8 T66_reportid;
 	u8 T100_reportid_min;
 	u8 T100_reportid_max;
+	u8 T102_reportid;
 };
 
 static struct mxt_suspend mxt_save[] = {
+	{MXT_PROCG_NOISE_T22, MXT_NOISE_CTRL,
+		MXT_T22_DISABLE, MXT_SUSPEND_DYNAMIC, 0},
 	{MXT_GEN_POWER_T7, MXT_POWER_IDLEACQINT,
 		MXT_T7_IDLEACQ_DISABLE, MXT_SUSPEND_DYNAMIC, 0},
 	{MXT_GEN_POWER_T7, MXT_POWER_ACTVACQINT,
@@ -686,10 +752,10 @@ static u8 mxt_read_chg(struct mxt_data *data)
 static int mxt_wait_for_chg(struct mxt_data *data)
 {
 	int timeout_counter = 0;
-	int count = 10;
+	int count = 100;
 
 	while ((timeout_counter++ <= count) && mxt_read_chg(data))
-		mdelay(10);
+		msleep(10);
 
 	if (timeout_counter > count) {
 		dev_err(&data->client->dev, "mxt_wait_for_chg() timeout!\n");
@@ -791,10 +857,13 @@ static int mxt_send_bootloader_cmd(struct mxt_data *data, bool unlock)
 	return 0;
 }
 
+static int mxt_chip_reset(struct mxt_data *data);
+
 static int mxt_read_reg(struct i2c_client *client,
 			u16 reg, u16 len, void *val)
 {
 	struct device *dev = &client->dev;
+	struct mxt_data *data =  i2c_get_clientdata(client);
 	struct i2c_msg xfer[2];
 	u8 buf[2];
 	int ret;
@@ -818,6 +887,8 @@ static int mxt_read_reg(struct i2c_client *client,
 	if (ret != ARRAY_SIZE(xfer)) {
 		dev_err(dev, "%s: i2c transfer failed (%d)\n",
 			__func__, ret);
+		if (data->init_complete)
+			mxt_chip_reset(data);
 		return -EIO;
 	}
 
@@ -827,6 +898,7 @@ static int mxt_read_reg(struct i2c_client *client,
 static int mxt_write_reg(struct i2c_client *client, u16 reg, u8 val)
 {
 	struct device *dev = &client->dev;
+	struct mxt_data *data =  i2c_get_clientdata(client);
 	u8 buf[3];
 
 	buf[0] = reg & 0xff;
@@ -835,13 +907,15 @@ static int mxt_write_reg(struct i2c_client *client, u16 reg, u8 val)
 
 	if (i2c_master_send(client, buf, 3) != 3) {
 		dev_err(dev, "%s: i2c send failed\n", __func__);
+		if (data->init_complete)
+			mxt_chip_reset(data);
 		return -EIO;
 	}
 
 	return 0;
 }
 
-static int mxt_write_block(struct i2c_client *client, u16 addr, u16 length, u8 *value)
+int mxt_write_block(struct i2c_client *client, u16 addr, u16 length, u8 *value)
 {
 	int i;
 	struct {
@@ -936,6 +1010,48 @@ static int mxt_soft_reset(struct mxt_data *data, u8 value)
 	return 0;
 }
 
+static void mxt_anti_calib_control(struct mxt_data *data, bool enable)
+{
+	struct device *dev = &data->client->dev;
+	int error;
+	int i;
+	int count = sizeof(data->anti_calib);
+	u8 anti_calib[] = {0xFF, 0x01, 0x00, 0x00};
+
+	if (enable) {
+		anti_calib[0] = data->anti_calib[0];
+		anti_calib[1] = data->anti_calib[1];
+		anti_calib[2] = data->anti_calib[2];
+		anti_calib[3] = data->anti_calib[3];
+	}
+
+	for (i = 0; i < count; i++) {
+		error = mxt_write_object(data, MXT_GEN_ACQUIRE_T8,
+				MXT_ACQUIRE_ATCHCALST+i, anti_calib[i]);
+		if (error) {
+			dev_err(dev, "write to t8 failed!\n");
+			return;
+		}
+	}
+}
+
+static void mxt_self_recalib_control(struct mxt_data *data, bool enable)
+{
+	struct device *dev = &data->client->dev;
+	int error;
+	u8 val;
+
+	if (enable)
+		val = data->self_recalib_para;
+	else
+		val = 0x3F;
+
+	error = mxt_write_object(data, MXT_SPT_SELFCAPHOVERCTECONFIG_T102,
+				MXT_SELF_RECALCFG, val);
+	if (error)
+		dev_err(dev, "Failed to write t102 recalib!\n");
+}
+
 static void mxt_proc_t6_messages(struct mxt_data *data, u8 *msg)
 {
 	struct device *dev = &data->client->dev;
@@ -951,6 +1067,17 @@ static void mxt_proc_t6_messages(struct mxt_data *data, u8 *msg)
 
 	if (status & MXT_STATUS_CAL) {
 		dev_info(dev, "Calibration start!\n");
+		if (data->is_recalib_available) {
+			mxt_anti_calib_control(data, true);
+			mxt_self_recalib_control(data, true);
+			data->cal_in_progress = true;
+		}
+	} else if (data->cal_in_progress) {
+		dev_info(dev, "Schedule delayed work for anti-touch setting!\n");
+		if (data->is_recalib_available) {
+			queue_delayed_work(data->work_queue, &data->update_setting_delayed_work, HZ);
+			data->cal_in_progress = false;
+		}
 	}
 
 	if (status)
@@ -1004,20 +1131,18 @@ static void mxt_proc_t9_messages(struct mxt_data *data, u8 *message)
 	amplitude = message[6];
 	vector = message[7];
 
-	if (data->debug_enabled) {
-		dev_info(dev,
-			"[%d] %c%c%c%c%c%c%c%c x: %d y: %d area: %d amp: %d vector: %02X\n",
-			id,
-			(status & MXT_T9_DETECT) ? 'D' : '.',
-			(status & MXT_T9_PRESS) ? 'P' : '.',
-			(status & MXT_T9_RELEASE) ? 'R' : '.',
-			(status & MXT_T9_MOVE) ? 'M' : '.',
-			(status & MXT_T9_VECTOR) ? 'V' : '.',
-			(status & MXT_T9_AMP) ? 'A' : '.',
-			(status & MXT_T9_SUPPRESS) ? 'S' : '.',
-			(status & MXT_T9_UNGRIP) ? 'U' : '.',
-			x, y, area, amplitude, vector);
-	}
+	dev_dbg(dev,
+		"[%d] %c%c%c%c%c%c%c%c x: %d y: %d area: %d amp: %d vector: %02X\n",
+		id,
+		(status & MXT_T9_DETECT) ? 'D' : '.',
+		(status & MXT_T9_PRESS) ? 'P' : '.',
+		(status & MXT_T9_RELEASE) ? 'R' : '.',
+		(status & MXT_T9_MOVE) ? 'M' : '.',
+		(status & MXT_T9_VECTOR) ? 'V' : '.',
+		(status & MXT_T9_AMP) ? 'A' : '.',
+		(status & MXT_T9_SUPPRESS) ? 'S' : '.',
+		(status & MXT_T9_UNGRIP) ? 'U' : '.',
+		x, y, area, amplitude, vector);
 
 	input_mt_slot(input_dev, id);
 
@@ -1041,6 +1166,56 @@ static void mxt_proc_t9_messages(struct mxt_data *data, u8 *message)
 		/* Touch no longer in detect, so close out slot */
 		mxt_input_sync(data);
 		input_mt_report_slot_state(input_dev, MT_TOOL_FINGER, 0);
+	}
+}
+
+#define TYPE_SELF_THR	0x1
+#define TYPE_SELF_INTTHR_STYLUS	0x2
+#define TYPE_SELF_INTTHR_SUSPEND	0x3
+static void mxt_adjust_self_setting(struct mxt_data *data, bool is_update, u8 type)
+{
+	struct device *dev = &data->client->dev;
+	const struct mxt_platform_data *pdata = data->pdata;
+	int error, i;
+	u8 update_val = 0;
+	u8 original_val = 0;
+	int index = data->current_index;
+	u8 reg_pos[2];
+	u8 val;
+	int count = sizeof(reg_pos);
+	u8 obj_num = MXT_SPT_AUXTOUCHCONFIG_T104;
+
+	if (type == TYPE_SELF_THR) {
+		update_val = pdata->config_array[index].selfthr_suspend;
+		original_val = data->selfthr_save;
+		reg_pos[0] = MXT_AUXTCHCFG_XTCHTHR;
+		reg_pos[1] = MXT_AUXTCHCFG_YTCHTHR;
+	} else if (type == TYPE_SELF_INTTHR_STYLUS) {
+		update_val = pdata->config_array[index].selfintthr_stylus;
+		original_val = data->intthr_save;
+		reg_pos[0] = MXT_AUXTCHCFG_INTTHRX;
+		reg_pos[1] = MXT_AUXTCHCFG_INTTHRY;
+	} else if (type == TYPE_SELF_INTTHR_SUSPEND) {
+		update_val = pdata->config_array[index].selfintthr_suspend;
+		original_val = data->intthr_save;
+		reg_pos[0] = MXT_AUXTCHCFG_INTTHRX;
+		reg_pos[1] = MXT_AUXTCHCFG_INTTHRY;
+	}
+
+	if(update_val == 0)
+		return;
+
+	if (is_update)
+		val = update_val;
+	else
+		val =original_val;
+
+	for (i = 0; i < count; i++) {
+		error = mxt_write_object(data, obj_num, reg_pos[i], val);
+		if (error) {
+			dev_err(dev, "Failed to write T104 pos 0x%x!\n", reg_pos[i]);
+			return;
+		}
 	}
 }
 
@@ -1073,6 +1248,301 @@ static int mxt_do_diagnostic(struct mxt_data *data, u8 mode)
 	return -ETIMEDOUT;
 }
 
+#define DELTA_TYPE_SELF	0x1
+#define DELTA_TYPE_MULT	0x2
+#define REF_TYPE_MULT		0x3
+#define REF_TYPE_MULT_MAX	0x4
+#define MONITOR_HAS_RISK	0x0
+#define MONITOR_NO_RISK	0x1
+#define MONITOR_IGNORE_IT	0x2
+
+static bool mxt_should_ignore_line(struct mxt_data *data,
+			bool is_rx, int line)
+{
+	int i;
+	int num;
+	int *target_array;
+
+	if (is_rx) {
+		num = data->ignore_rx_num;
+		target_array = data->ignore_rx;
+	}
+	else {
+		num = data->ignore_tx_num;
+		target_array = data->ignore_tx;
+	}
+
+	for (i = 0; i < num; i++) {
+		if (line == target_array[i])
+			return true;
+	}
+
+	return false;
+}
+
+static int mxt_monitor_delta_no_calib_risk(struct mxt_data *data, u8 type)
+{
+	struct device *dev = &data->client->dev;
+	int error, i;
+	u16 addr = data->T37_address;
+	short val, no_touch_threshold, prev_val;
+	u8 *buf;
+	size_t buf_size;
+	u8 mode;
+	const struct mxt_platform_data *pdata = data->pdata;
+	int index = data->current_index;
+	int result = MONITOR_NO_RISK;
+	int read_size = 0;
+	int count = 0, row = 0;
+	short *ref_buf;
+	int diff_max;
+
+	if (type == DELTA_TYPE_SELF) {
+		buf_size = MXT_DIAG_SELF_SIZE;
+		mode = MXT_DIAG_SELF_DELTA;
+		no_touch_threshold = pdata->config_array[index].self_no_touch_threshold;
+	} else if (type == DELTA_TYPE_MULT) {
+		buf_size = MXT_DIAG_TOTAL_SIZE;
+		mode = MXT_DIAG_MULT_DELTA;
+		no_touch_threshold = pdata->config_array[index].mult_no_touch_threshold;
+	} else if (type == REF_TYPE_MULT || type == REF_TYPE_MULT_MAX) {
+		buf_size = MXT_DIAG_TOTAL_SIZE;
+		mode = MXT_DIAG_MULT_REF;
+		ref_buf = (short*)kmalloc(sizeof(short) * (buf_size >> 1), GFP_KERNEL);
+		if (ref_buf == NULL)
+			return MONITOR_NO_RISK;
+	} else
+		return MONITOR_NO_RISK;
+
+	buf = kmalloc(buf_size, GFP_KERNEL);
+	if (buf == NULL) {
+		dev_err(dev, "Failed to alloc buffer for delta getting!\n");
+		return MONITOR_NO_RISK;
+	}
+
+	error = mxt_do_diagnostic(data, mode);
+	if (error) {
+		dev_err(dev, "Failed to send get self delta data cmd!\n");
+		result = false;
+		goto end;
+	}
+
+	while (read_size < buf_size) {
+		error = mxt_read_reg(data->client, addr + 2,
+					MXT_DIAG_PAGE_SIZE, buf + read_size);
+		if (error) {
+			dev_err(dev, "Read from T37 failed!\n");
+			return error;
+		}
+
+		read_size += MXT_DIAG_PAGE_SIZE;
+
+		error = mxt_do_diagnostic(data, MXT_DIAG_PAGE_UP);
+		if (error) {
+			dev_err(dev, "do diagnostic 0x%02x failed!\n", MXT_DIAG_PAGE_UP);
+			return error;
+		}
+	}
+
+	for (i = 0; i < buf_size; i += 2) {
+		val = (buf[i+1] << 8) | buf[i];
+		if (data->debug_enabled && type != REF_TYPE_MULT)
+			dev_info(dev, "val = 0x%04x\n", val);
+		if (type == DELTA_TYPE_SELF) {
+			if (abs(val) > no_touch_threshold)
+				result = MONITOR_HAS_RISK;
+		} else if (type == DELTA_TYPE_MULT) {
+			if (val > no_touch_threshold || val < -(no_touch_threshold)) {
+				if (data->debug_enabled)
+					pr_info("risk val = %d\n", (int)val);
+				result = MONITOR_HAS_RISK;
+			}
+		} else if (type == REF_TYPE_MULT || type == REF_TYPE_MULT_MAX) {
+			ref_buf[row * pdata->rx_num + count] = val;
+			count ++;
+			if (data->debug_enabled) {
+				if (count == 1)
+					printk(KERN_CONT "#### ");
+				printk(KERN_CONT "%5d ", val);
+			}
+			if (count >= 2) {
+				short delta;
+				delta = val - prev_val;
+				if (count < (pdata->rx_num - 1) && row < (pdata->tx_num - 4)) {
+					if (abs(delta) >= pdata->ref_diff_threshold &&
+							type == REF_TYPE_MULT_MAX) {
+						if (!mxt_should_ignore_line(data, true, count)) {
+							data->ignore_rx[data->ignore_rx_num++] = count;
+							pr_info("ignore column = %d\n", count);
+						}
+					}
+					if (abs(delta) >= diff_max &&
+							type == REF_TYPE_MULT_MAX)
+						diff_max = abs(delta);
+
+					if (type == REF_TYPE_MULT) {
+						if (!mxt_should_ignore_line(data, true, count)) {
+							if (abs(delta) >= data->ref_diff_threshold) {
+									dev_info(dev, "horizontal failed diff row = %d, col = %d, diff = %d\n",
+									row, count, delta);
+									result = MONITOR_HAS_RISK;
+									break;
+							}
+						} else if (data->debug_enabled)
+							dev_info(dev, "col %d is ignored!\n", count);
+					}
+				}
+			}
+
+			if (row >= 1 && row < (pdata->tx_num - 4) &&
+				row != pdata->tx_num/2) { /* skip last line and half line*/
+				short delta = val - ref_buf[(row -1) * pdata->rx_num + count - 1];
+				if (abs(delta) >= pdata->ref_diff_threshold &&
+						type == REF_TYPE_MULT_MAX) {
+					if (!mxt_should_ignore_line(data, false, row)) {
+						data->ignore_tx[data->ignore_tx_num++] = row;
+						pr_info("ignore row = %d\n", row);
+					}
+				}
+				if (abs(delta) >= diff_max &&
+						type == REF_TYPE_MULT_MAX)
+					diff_max = abs(delta);
+
+				if (type == REF_TYPE_MULT) {
+					if (!mxt_should_ignore_line(data, false, row)) {
+						if (abs(delta) >= data->ref_diff_threshold) {
+							dev_info(dev, "vertical failed diff row = %d, col = %d, diff = %d\n",
+											row, count, delta);
+							result = MONITOR_HAS_RISK;
+							break;
+						}
+					} else if (data->debug_enabled)
+						dev_info(dev, "row %d is ignored!\n", row);
+				}
+			}
+
+			if (count == pdata->rx_num) {
+				if (data->debug_enabled)
+					printk(KERN_CONT "\n");
+				count = 0;
+				row ++;
+			}
+			prev_val = val;
+		}
+	}
+
+	if (type == DELTA_TYPE_SELF && result == MONITOR_HAS_RISK) {
+		if (data->self_restore_done && data->touch_num > 0) {
+			dev_info(dev, "ignore current polling!\n");
+			result = MONITOR_IGNORE_IT;
+
+		} else if (!data->self_restore_done && data->touch_num == 1)  {
+			dev_info(dev, "ignore current polling!\n");
+			result = MONITOR_IGNORE_IT;
+		}
+	}
+
+end:
+	if (type == REF_TYPE_MULT || type == REF_TYPE_MULT_MAX)
+		kfree(ref_buf);
+	kfree(buf);
+	if (type != REF_TYPE_MULT_MAX)
+		return result;
+	else
+		return diff_max;
+}
+
+static void mxt_do_calibration(struct mxt_data *data)
+{
+	struct device *dev = &data->client->dev;
+	int error, i;
+	u8 val;
+	int time_out = 100;
+
+	error = mxt_write_object(data, MXT_GEN_COMMAND_T6,
+				MXT_COMMAND_CALIBRATE, 1);
+	if (error) {
+		dev_err(dev, "failed to do calibration!\n");
+		return;
+	}
+
+	for (i = 0; i < time_out; i++) {
+		error = mxt_read_object(data, MXT_GEN_COMMAND_T6,
+					MXT_COMMAND_CALIBRATE, &val);
+		if (error) {
+			dev_err(dev, "failed to read calibration!\n");
+			return;
+		}
+
+		if (val == 0)
+			break;
+		msleep(10);
+	}
+}
+
+#define MAX_SAFE_COUNT		8
+#define RISK_WEIGHT		2
+#define SAFE_WEIGHT		1
+static void mxt_update_setting_delayed_work(struct work_struct *work)
+{
+	struct delayed_work *delayed_work = to_delayed_work(work);
+	struct mxt_data *data = container_of(delayed_work, struct mxt_data, update_setting_delayed_work);
+	int status;
+	u8 monitor_type;
+
+	dev_info(&data->client->dev,
+		"Update setting delayed work called. safe_count = %d\n",
+		data->safe_count);
+
+	if (data->gr_enable)
+		monitor_type = DELTA_TYPE_SELF;
+	else
+		monitor_type = REF_TYPE_MULT;
+	status = mxt_monitor_delta_no_calib_risk(data, monitor_type);
+	if (status == MONITOR_NO_RISK) {
+		if (data->prev_status == MONITOR_HAS_RISK) {
+			if (data->safe_count >= RISK_WEIGHT)
+				data->safe_count -= RISK_WEIGHT;
+		} else if (data->prev_status == MONITOR_NO_RISK)
+			data->safe_count += SAFE_WEIGHT;
+		if (data->safe_count == MAX_SAFE_COUNT) {
+			data->safe_count = 0;
+			queue_delayed_work(data->work_queue, &data->disable_anticalib_delayed_work, HZ);
+		} else
+			queue_delayed_work(data->work_queue, &data->update_setting_delayed_work, HZ);
+	}
+	else {
+		if (status == MONITOR_HAS_RISK) {
+			if (!data->gr_enable || data->sensitive_mode) {
+				mxt_do_calibration(data);
+			}
+		}
+
+		queue_delayed_work(data->work_queue, &data->update_setting_delayed_work, HZ);
+	}
+
+	data->prev_status = status;
+}
+
+static int mxt_do_curr_golden_ref_tune(struct mxt_data *data);
+
+static void mxt_disable_anticalib_delayed_work(struct work_struct *work)
+{
+	struct delayed_work *delayed_work = to_delayed_work(work);
+	struct mxt_data *data = container_of(delayed_work, struct mxt_data, disable_anticalib_delayed_work);
+	int error;
+
+	mxt_anti_calib_control(data, false);
+	mxt_self_recalib_control(data, false);
+	if (!data->use_last_golden && !data->gr_enable) {
+		error = mxt_do_curr_golden_ref_tune(data);
+		if (!error) {
+			dev_info(&data->client->dev, "last golden OK, set flag !\n");
+			data->use_last_golden = true;
+		}
+	}
+}
+
 static void mxt_proc_t100_messages(struct mxt_data *data, u8 *message)
 {
 	struct device *dev = &data->client->dev;
@@ -1086,6 +1556,7 @@ static void mxt_proc_t100_messages(struct mxt_data *data, u8 *message)
 	u8 peak = 0;
 	int id;
 	int index = 0;
+	int finger_state = 0;
 
 	if (!input_dev || data->driver_paused)
 		return;
@@ -1103,6 +1574,8 @@ static void mxt_proc_t100_messages(struct mxt_data *data, u8 *message)
 		data->touch_num = message[2];
 		if (data->debug_enabled)
 			dev_info(dev, "touch num = %d\n", data->touch_num);
+		if (data->touch_num > 1 && !data->self_restore_done)
+			data->land_signed = 0;
 
 		if (status & MXT_T100_SUP)
 		{
@@ -1116,6 +1589,7 @@ static void mxt_proc_t100_messages(struct mxt_data *data, u8 *message)
 	}
 	else if (id >= 2) {
 		/* deal with each point report */
+		int prev_state = data->finger_tracker[id - 2].state;
 		status = message[1];
 		x = (message[3] << 8) | (message[2] & 0xFF);
 		y = (message[5] << 8) | (message[4] & 0xFF);
@@ -1135,7 +1609,57 @@ static void mxt_proc_t100_messages(struct mxt_data *data, u8 *message)
 		input_mt_slot(input_dev, id - 2);
 
 		if (status & MXT_T100_DETECT) {
+			finger_state |= 1;
+			if (prev_state == 0) {
+				data->finger_tracker[id - 2].x = x;
+				data->finger_tracker[id - 2].y = y;
+				data->finger_tracker[id - 2].jiffies_val = jiffies;
+			} else {
+				unsigned long landed_jiffies;
+				int delta_x, delta_y, threshold;
+
+				landed_jiffies = data->finger_tracker[id - 2].jiffies_val;
+				landed_jiffies += data->pdata->landing_jiffies;
+
+				if ((prev_state & 0x80) == 0) {
+					/* use the big threshold for landing period */
+					if (time_before(jiffies, landed_jiffies)) {
+						if (data->finger_tracker[id - 2].x >=  data->max_x - data->pdata->edge_clip ||
+							data->finger_tracker[id - 2].x <= data->pdata->edge_clip)
+							threshold = data->pdata->landing_edge_threshold;
+						else
+							threshold = data->pdata->landing_threshold;
+					}
+					else /* use the middle jitter threshold */
+						threshold = data->pdata->staying_threshold;
+				}  else { /* use the small threshold during movement */
+					threshold = data->pdata->moving_threshold;
+				}
+				delta_x = x - data->finger_tracker[id - 2].x;
+				delta_y = y - data->finger_tracker[id - 2].y;
+
+				/* report the recorded position if the change is small */
+				if (delta_x * delta_x + delta_y * delta_y <= threshold * threshold) {
+					x = data->finger_tracker[id - 2].x;
+					y = data->finger_tracker[id - 2].y;
+					finger_state |= (prev_state & 0x80);
+				} else { /* save new location and set moving flag */
+					data->finger_tracker[id - 2].x = x;
+					data->finger_tracker[id - 2].y = y;
+					finger_state |= 0x80;
+				}
+			 }
 			/* Touch in detect, report X/Y position */
+			if (data->touch_num == 1 &&
+				!data->land_signed &&
+				!data->self_restore_done) {
+				data->finger.x = x;
+				data->finger.y = y;
+				data->land_signed = 1;
+				if (data->debug_enabled)
+					dev_info(dev, "One touch signed\n");
+			}
+
 			input_mt_report_slot_state(input_dev, MT_TOOL_FINGER, 1);
 			input_report_abs(input_dev, ABS_MT_POSITION_X, x);
 			input_report_abs(input_dev, ABS_MT_POSITION_Y, y);
@@ -1158,9 +1682,25 @@ static void mxt_proc_t100_messages(struct mxt_data *data, u8 *message)
 			}
 		} else {
 			/* Touch no longer in detect, so close out slot */
+			if (data->touch_num == 0 &&
+				data->land_signed &&
+				!data->self_restore_done) {
+				int delta_x = x - data->finger.x;
+				int delta_y = y - data->finger.y;
+				if(delta_x * delta_x +  delta_y * delta_y >=
+					data->pdata->unlock_move_threshold) {
+					data->self_restore_done = true;
+					mxt_adjust_self_setting(data, false, TYPE_SELF_THR);
+					mxt_adjust_self_setting(data, false, TYPE_SELF_INTTHR_SUSPEND);
+					dev_info(dev, "unlocked, set intthr to normal!\n");
+				} else
+					data->land_signed = 0;
+			}
+			finger_state = 0;
 			mxt_input_sync(data);
 			input_mt_report_slot_state(input_dev, MT_TOOL_FINGER, 0);
 		}
+		data->finger_tracker[id - 2].state = finger_state;
 	}
 }
 
@@ -1301,6 +1841,7 @@ static void mxt_proc_t66_messages(struct mxt_data *data, u8 *msg)
 {
 	struct device *dev = &data->client->dev;
 
+	mutex_lock(&data->golden_mutex);
 	dev_info(dev, "message for t66= 0x%x 0x%x 0x%x 0x%x\n",
 			msg[1], msg[2], msg[3], msg[4]);
 
@@ -1308,6 +1849,20 @@ static void mxt_proc_t66_messages(struct mxt_data *data, u8 *msg)
 	data->golden_msg.fcalmaxdiff = msg[2];
 	data->golden_msg.fcalmaxdiffx = msg[3];
 	data->golden_msg.fcalmaxdiffy = msg[4];
+	mutex_unlock(&data->golden_mutex);
+}
+
+static void mxt_proc_t102_messages(struct mxt_data *data, u8 *msg)
+{
+	struct device *dev = &data->client->dev;
+
+	dev_info(dev, "msg for t102 = 0x%x 0x%x 0x%x 0x%x\n",
+		msg[2], msg[3], msg[4], msg[5]);
+
+	if (msg[2] == 0x3) {
+		data->selfcap_status.cause = msg[2];
+		data->selfcap_status.error_code = msg[3];
+	}
 }
 
 static int mxt_proc_message(struct mxt_data *data, u8 *msg)
@@ -1348,6 +1903,8 @@ static int mxt_proc_message(struct mxt_data *data, u8 *msg)
 	} else if (report_id >= data->T100_reportid_min
 		   && report_id <= data->T100_reportid_max) {
 		mxt_proc_t100_messages(data, msg);
+	} else if (report_id == data->T102_reportid) {
+		mxt_proc_t102_messages(data, msg);
 	}
 
 	return 0;
@@ -1403,7 +1960,7 @@ static irqreturn_t mxt_read_messages_t44(struct mxt_data *data)
 	count = data->msg_buf[0];
 
 	if (count == 0) {
-		dev_dbg(dev, "Interrupt triggered but zero messages\n");
+		dev_warn(dev, "Interrupt triggered but zero messages\n");
 		return IRQ_NONE;
 	} else if (count > data->max_reportid) {
 		dev_err(dev, "T44 count exceeded max report id\n");
@@ -1516,7 +2073,7 @@ static void mxt_read_current_crc(struct mxt_data *data)
 	/* on failure, CRC is set to 0 and config will always be downloaded */
 }
 
-static int mxt_download_config(struct mxt_data *data, const char *fn)
+int mxt_download_config(struct mxt_data *data, const char *fn)
 {
 	struct device *dev = &data->client->dev;
 	struct mxt_info cfg_info;
@@ -1626,9 +2183,6 @@ static int mxt_download_config(struct mxt_data *data, const char *fn)
 		}
 		data_pos += offset;
 
-		pr_info("write to type = %d, instance = %d, size = %d, offset = %d\n",
-			(int)type, (int)instance, (int)size, (int)offset);
-
 		object = mxt_get_object(data, type);
 		if (!object) {
 			ret = -EINVAL;
@@ -1645,27 +2199,28 @@ static int mxt_download_config(struct mxt_data *data, const char *fn)
 
 		if (size > object->size) {
 			/* Either we are in fallback mode due to wrong
-			* config or config from a later fw version,
-			* or the file is corrupt or hand-edited */
+			 * config or config from a later fw version,
+			 * or the file is corrupt or hand-edited */
 			dev_warn(dev, "Discarding %u bytes in T%u!\n",
-				size - object->size, type);
+				 size - object->size, type);
+
 			size = object->size;
 		} else if (object->size > size) {
 			/* If firmware is upgraded, new bytes may be added to
-			* end of objects. It is generally forward compatible
-			* to zero these bytes - previous behaviour will be
-			* retained. However this does invalidate the CRC and
-			* will force fallback mode until the configuration is
-			* updated. We warn here but do nothing else - the
-			* malloc has zeroed the entire configuration. */
+			 * end of objects. It is generally forward compatible
+			 * to zero these bytes - previous behaviour will be
+			 * retained. However this does invalidate the CRC and
+			 * will force fallback mode until the configuration is
+			 * updated. We warn here but do nothing else - the
+			 * malloc has zeroed the entire configuration. */
 			dev_warn(dev, "Zeroing %d byte(s) in T%d\n",
-				object->size - size, type);
+				 object->size - size, type);
 		}
 
 		for (i = 0; i < size; i++) {
 			ret = sscanf(cfg->data + data_pos, "%hhx%n",
-					&val,
-					&offset);
+				     &val,
+				     &offset);
 			if (ret != 1) {
 				dev_err(dev, "Bad format\n");
 				ret = -EINVAL;
@@ -1675,7 +2230,7 @@ static int mxt_download_config(struct mxt_data *data, const char *fn)
 			byte_offset = reg + i - config_start_offset;
 
 			if ((byte_offset >= 0)
-				&& (byte_offset <= config_mem_size)) {
+			    && (byte_offset <= config_mem_size)) {
 				*(config_mem + byte_offset) = val;
 			} else {
 				dev_err(dev, "Bad object: reg:%d, T%d, ofs=%d\n",
@@ -1686,6 +2241,7 @@ static int mxt_download_config(struct mxt_data *data, const char *fn)
 
 			data_pos += offset;
 		}
+
 	}
 
 	/* calculate crc of the received configs (not the raw config file) */
@@ -1725,8 +2281,6 @@ release:
 	return ret;
 }
 
-static int mxt_chip_reset(struct mxt_data *data);
-
 static int mxt_set_power_cfg(struct mxt_data *data, u8 mode)
 {
 	struct device *dev = &data->client->dev;
@@ -1754,12 +2308,6 @@ static int mxt_set_power_cfg(struct mxt_data *data, u8 mode)
 					mxt_save[i].suspend_obj,
 					mxt_save[i].suspend_reg,
 					mxt_save[i].suspend_val);
-			if (error) {
-				error = mxt_chip_reset(data);
-				if (error)
-					dev_err(dev, "Failed to do chip reset!\n");
-				break;
-			}
 		}
 		break;
 
@@ -1774,12 +2322,6 @@ static int mxt_set_power_cfg(struct mxt_data *data, u8 mode)
 						mxt_save[cnt].suspend_obj,
 						mxt_save[cnt].suspend_reg,
 						mxt_save[cnt].restore_val);
-			if (error) {
-				error = mxt_chip_reset(data);
-				if (error)
-					dev_err(dev, "Failed to do chip reset!\n");
-				break;
-			}
 		}
 		break;
 	}
@@ -1921,6 +2463,7 @@ static const char * mxt_get_config(struct mxt_data *data, bool is_default)
 {
 	const struct mxt_platform_data *pdata = data->pdata;
 	int i;
+	int lcd_id = 1;
 
 	for (i = 0; i < pdata->config_array_size; i++) {
 		if (data->info.family_id== pdata->config_array[i].family_id &&
@@ -1928,8 +2471,11 @@ static const char * mxt_get_config(struct mxt_data *data, bool is_default)
 			data->info.version == pdata->config_array[i].version &&
 			data->info.build == pdata->config_array[i].build) {
 			if (!is_default) {
-				data->current_index = i;
-				return  pdata->config_array[i].mxt_cfg_name;
+				if (data->vendor_id == pdata->config_array[i].vendor_id &&
+					lcd_id == pdata->config_array[i].lcd_id) {
+					data->current_index = i;
+					return  pdata->config_array[i].mxt_cfg_name;
+				}
 			} else {
 				data->current_index = i;
 				return  pdata->config_array[i].mxt_cfg_name;
@@ -1986,11 +2532,15 @@ static int mxt_check_reg_init(struct mxt_data *data)
 	bool is_recheck = false;
 
 start:
-	if (0)
-		ret = mxt_read_internal_gpio(data);
-
-	config_name = mxt_get_config(data, false);
-	is_recheck = false;
+	ret = mxt_read_internal_gpio(data);
+	if (ret) {
+		dev_err(dev, "Can not get internal gpio status, just give default one!\n");
+		config_name = mxt_get_config(data, true);
+		is_recheck = true;
+	} else {
+		config_name = mxt_get_config(data, false);
+		is_recheck = false;
+	}
 
 	if (config_name == NULL) {
 		dev_info(dev, "Not found matched config!\n");
@@ -2146,6 +2696,9 @@ static int mxt_get_object_table(struct mxt_data *data)
 			data->T100_reportid_min = object->min_reportid;
 			data->num_touchids = object->num_report_ids * object->instances;
 			break;
+		case MXT_SPT_SELFCAPHOVERCTECONFIG_T102:
+			data->T102_reportid = object->max_reportid;
+			break;
 		}
 
 		dev_dbg(dev, "T%u, start:%u size:%u instances:%u "
@@ -2286,7 +2839,7 @@ static int mxt_read_resolution(struct mxt_data *data)
 	return 0;
 }
 
-static int mxt_initialize_regulator(struct mxt_data *data, bool on)
+static void mxt_initialize_regulator(struct mxt_data *data)
 {
 	int ret;
 	struct i2c_client *client = data->client;
@@ -2296,8 +2849,6 @@ static int mxt_initialize_regulator(struct mxt_data *data, bool on)
 		XVdd must not be powered up until after Vdd
 		and must obey the rate-of-rise specification
 	*/
-	if (!on)
-		goto err_disable_vdd;
 
 	data->regulator_vdd = devm_regulator_get(&client->dev, "vdd");
 	if (IS_ERR(data->regulator_vdd)) {
@@ -2307,44 +2858,134 @@ static int mxt_initialize_regulator(struct mxt_data *data, bool on)
 		goto err_null_regulator;
 	}
 
-	if (regulator_count_voltages(data->regulator_vdd) > 0) {
-		ret = regulator_set_voltage(data->regulator_vdd, MXT_VTG_MIN_UV,
-						MXT_VTG_MAX_UV);
-		if (ret) {
-			dev_err(&client->dev,
-				"Regulator set_vtg failed vdd ret = %d\n", ret);
-			goto err_put_vdd_regulator;
-		}
+	data->regulator_avdd = devm_regulator_get(&client->dev, "avdd");
+	if (IS_ERR(data->regulator_avdd)) {
+		dev_info(&client->dev,
+			"Atmel regulator_get for avdd failed: %ld\n",
+						PTR_ERR(data->regulator_avdd));
+		goto err_put_regulator;
 	}
 
 	dev_info(&client->dev,
-		"Atmel regulator_get for vdd succeeded\n");
+		"Atmel regulator_get for vdd and avdd succeeded\n");
 
 	ret = regulator_enable(data->regulator_vdd);
-	if (ret < 0) {
+	if (ret < 0)
 		dev_err(&client->dev,
-			"Atmel regulator_enable for vdd failed; Error code:%d\n", ret);
-		goto err_vdd_set_vtg;
-	}
+		"Atmel regulator_enable for vdd failed; Error code:%d\n", ret);
 
-	return 0;
+	ret = regulator_enable(data->regulator_avdd);
+	if (ret < 0)
+		dev_err(&client->dev,
+		"Atmel regulator_enable for avdd failed; Error code:%d\n", ret);
+	return;
 
-err_disable_vdd:
-	regulator_disable(data->regulator_vdd);
-err_vdd_set_vtg:
-	if (regulator_count_voltages(data->regulator_vdd) > 0)
-		regulator_set_voltage(data->regulator_vdd, 0, MXT_VTG_MAX_UV);
-err_put_vdd_regulator:
+err_put_regulator:
 	devm_regulator_put(data->regulator_vdd);
 err_null_regulator:
+	data->regulator_avdd = NULL;
 	data->regulator_vdd = NULL;
-
-	return -EINVAL;
 }
 
 static ssize_t mxt_update_fw_store(struct device *dev,
 					struct device_attribute *attr,
 					const char *buf, size_t count);
+
+static int mxt_update_self_chgtime(struct mxt_data *data, bool inc)
+{
+	int error;
+	u8 val;
+	struct device *dev = &data->client->dev;
+	const struct mxt_platform_data *pdata = data->pdata;
+	int index = data->current_index;
+
+	error = mxt_read_object(data, MXT_SPT_SELFCAPHOVERCTECONFIG_T102,
+				MXT_SELF_CHGTIME, &val);
+	if (error) {
+		dev_err(dev, "Failed to get self charge time!\n");
+		return error;
+	}
+
+	if (inc) {
+		val += 5;
+		if (val > pdata->config_array[index].self_chgtime_max)
+			return -ERANGE;
+	}
+	else {
+		val -= 5;
+		if (val < pdata->config_array[index].self_chgtime_min)
+			return -ERANGE;
+	}
+
+	error = mxt_write_object(data, MXT_SPT_SELFCAPHOVERCTECONFIG_T102,
+				MXT_SELF_CHGTIME, val);
+
+	return error;
+}
+
+static int mxt_wait_for_self_tune_msg(struct mxt_data *data)
+{
+	int time_out = 1000;
+	int i = 0;
+
+	while(i < time_out) {
+		if (data->selfcap_status.cause == 0x3)
+			return 0;
+		i++;
+		msleep(10);
+	}
+
+	return -ETIMEDOUT;
+}
+
+static int mxt_do_self_tune(struct mxt_data *data, u8 cmd, bool nv_backup)
+{
+	int error;
+	struct device *dev = &data->client->dev;
+
+	memset(&data->selfcap_status, 0x0, sizeof(data->selfcap_status));
+
+	if (mxt_get_object(data, MXT_SPT_SELFCAPHOVERCTECONFIG_T102) == NULL) {
+		dev_err(dev, "Not T102 exist!\n");
+		return 0;
+	}
+
+	error = mxt_write_object(data, MXT_SPT_SELFCAPHOVERCTECONFIG_T102,
+					MXT_SELFCAP_CMD, cmd);
+	if (error) {
+		dev_err(dev, "Error when execute cmd 0x%x!\n", cmd);
+		return error;
+	}
+
+	error = mxt_wait_for_self_tune_msg(data);
+
+	if(!error) {
+		if (data->selfcap_status.error_code & 0x02) {
+			error = mxt_update_self_chgtime(data, true);
+			if (error)
+				return error;
+			return -EINVAL;
+		} else if (data->selfcap_status.error_code & 0x01) {
+			error = mxt_update_self_chgtime(data, false);
+			if (error)
+				return error;
+			return -EINVAL;
+		} else
+			dev_info(dev, "Tuning pass!\n");
+	} else
+		return -EINVAL;
+
+	if (nv_backup) {
+		error = mxt_write_object(data, MXT_SPT_SELFCAPHOVERCTECONFIG_T102,
+					MXT_SELFCAP_CMD, MXT_SELFCMD_STORE);
+		if (error) {
+			dev_err(dev, "Error when execute cmd store!\n");
+			return error;
+		}
+	}
+
+	return 0;
+}
 
 static int mxt_get_t38_flag(struct mxt_data *data)
 {
@@ -2364,9 +3005,31 @@ static int mxt_get_t38_flag(struct mxt_data *data)
 static int mxt_get_init_setting(struct mxt_data *data)
 {
 	int error;
+	u8 selfthr;
+	u8 intthr;
 	u8 glovectrl;
 	u8 atchthr;
+	u8 anti_calib[4];
+	int i;
 	struct device *dev = &data->client->dev;
+
+	if (mxt_get_object(data, MXT_SPT_AUXTOUCHCONFIG_T104) != NULL) {
+		error = mxt_read_object(data, MXT_SPT_AUXTOUCHCONFIG_T104,
+						MXT_AUXTCHCFG_XTCHTHR, &selfthr);
+		if (error) {
+			dev_err(dev, "Failed to read self threshold from t104!\n");
+			return error;
+		}
+		data->selfthr_save = selfthr;
+
+		error = mxt_read_object(data, MXT_SPT_AUXTOUCHCONFIG_T104,
+						MXT_AUXTCHCFG_INTTHRX, &intthr);
+		if (error) {
+			dev_err(dev, "Failed to read internal threshold from t104!\n");
+			return error;
+		}
+		data->intthr_save= intthr;
+	}
 
 	if (mxt_get_object(data, MXT_PROCI_GLOVEDETECTION_T78) != NULL) {
 		error = mxt_read_object(data, MXT_PROCI_GLOVEDETECTION_T78,
@@ -2387,6 +3050,26 @@ static int mxt_get_init_setting(struct mxt_data *data)
 			return error;
 		}
 		data->atchthr = atchthr;
+	}
+
+	if (mxt_get_object(data, MXT_SPT_SELFCAPHOVERCTECONFIG_T102) != NULL) {
+		error = mxt_read_object(data, MXT_SPT_SELFCAPHOVERCTECONFIG_T102,
+					MXT_SELF_RECALCFG, &data->self_recalib_para);
+		if (error) {
+			dev_err(dev, "Faield to read from t102 self recalib para!\n");
+			return error;
+		}
+	}
+
+	/* always have T8 */
+	for (i = 0; i < sizeof(anti_calib); i++) {
+		error = mxt_read_object(data, MXT_GEN_ACQUIRE_T8,
+					MXT_ACQUIRE_ATCHCALST+i, &anti_calib[i]);
+		if (error) {
+			dev_err(dev, "Failed to read from t8!\n");
+			return error;
+		}
+		data->anti_calib[i] = anti_calib[i];
 	}
 
 	error = mxt_read_resolution(data);
@@ -2977,268 +3660,108 @@ static ssize_t mxt_slowscan_store(struct device *dev,
 	return count;
 }
 
-static void mxt_do_calibration(struct mxt_data *data)
+static void mxt_self_tune(struct mxt_data *data, u8 nv_backup)
 {
 	struct device *dev = &data->client->dev;
-	int error, i;
-	u8 val;
-	int time_out = 100;
+	int retry_times = 10;
+	int i = 0;
+	int error;
 
-	error = mxt_write_object(data, MXT_GEN_COMMAND_T6,
-				MXT_COMMAND_CALIBRATE, 1);
-	if (error) {
-		dev_err(dev, "failed to do calibration!\n");
-		return;
-	}
-
-	for (i = 0; i < time_out; i++) {
-		error = mxt_read_object(data, MXT_GEN_COMMAND_T6,
-					MXT_COMMAND_CALIBRATE, &val);
-		if (error) {
-			dev_err(dev, "failed to read calibration!\n");
+	while(i < retry_times) {
+		error = mxt_do_self_tune(data, MXT_SELFCMD_TUNE, (bool)nv_backup);
+		if (!error)
+			return;
+		else if (error == -ERANGE) {
+			dev_err(dev, "self out of range!\n");
 			return;
 		}
-
-		if (val == 0)
-			break;
-		msleep(10);
-	}
-}
-
-static ssize_t mxt_update_fw_flag_store(struct device *dev,
-	struct device_attribute *attr, const char *buf, size_t count)
-{
-	struct mxt_data *data = dev_get_drvdata(dev);
-	int ret = 0;
-	int i;
-
-	if (sscanf(buf, "%u", &i) == 1)  {
-		dev_dbg(dev, "write fw update flag %d to t38\n", i);
-		ret = mxt_write_object(data, MXT_SPT_USERDATA_T38,
-					MXT_FW_UPDATE_FLAG, (u8)i);
-		if (ret < 0)
-			return ret;
-		ret = mxt_backup_nv(data);
-		if (ret)
-			return ret;
+		i++;
 	}
 
-	return count;
+	dev_err(dev, "Even retry self tuning for 10 times, still can't pass.!\n");
 }
 
-static ssize_t mxt_selftest_show(struct device *dev,
-	struct device_attribute *attr, char *buf)
-{
-	struct mxt_data *data = dev_get_drvdata(dev);
-	return sprintf(buf, "%02x, %02x, %02x, %02x, %02x, %02x\n",
-			data->test_result[0], data->test_result[1],
-			data->test_result[2], data->test_result[3],
-			data->test_result[4], data->test_result[5]);
-}
+static void mxt_enable_golden_ref(struct mxt_data *data, bool enable);
 
-static ssize_t mxt_selftest_store(struct device *dev,
-	struct device_attribute *attr, const char *buf, size_t count)
+#define MAX_DIFF_MARGIN	50
+static void mxt_pre_use_work(struct work_struct* work)
 {
-	struct mxt_data *data = dev_get_drvdata(dev);
-	int error;
-	u8 selftest_cmd;
+	struct mxt_data *data = container_of(work, struct mxt_data, pre_use_work);
+	const struct mxt_platform_data *pdata = data->pdata;
+	struct device *dev = &data->client->dev;
+	int val;
+	int i = 0;
 
-	/* run all selftest */
-	error = mxt_write_object(data,
-			MXT_SPT_SELFTEST_T25,
-			0x01, 0xfe);
-	if (!error) {
-		while (true) {
-			msleep(10);
-			error = mxt_read_object(data,
-					MXT_SPT_SELFTEST_T25,
-					0x01, &selftest_cmd);
-			if (error || selftest_cmd == 0)
+	mxt_self_tune(data, false);
+
+	if (!data->gr_enable && !data->is_ignore_channel_saved) {
+		mxt_enable_golden_ref(data, true);
+		mxt_anti_calib_control(data, false);
+		mxt_self_recalib_control(data, false);
+		msleep(1000);
+		while(mxt_monitor_delta_no_calib_risk(data, DELTA_TYPE_MULT)
+			!= MONITOR_NO_RISK) {
+			dev_info(dev, "time %d Risk exists, wait until no touch!\n", i);
+			msleep(100);
+			i ++;
+			if (i == 50)
 				break;
 		}
+
+		mxt_anti_calib_control(data, true);
+		mxt_self_recalib_control(data, true);
+		mxt_enable_golden_ref(data, false);
+		mxt_do_calibration(data);
+		msleep(2000);
+		data->ignore_rx_num = 0;
+		data->ignore_tx_num = 0;
+		val = mxt_monitor_delta_no_calib_risk(data, REF_TYPE_MULT_MAX);
+		dev_info(dev, "Ignore tx num = %d rx num = %d\n",
+				data->ignore_tx_num, data->ignore_rx_num);
+		data->ref_diff_threshold = pdata->ref_diff_threshold;
+
+		if (data->ignore_rx_num >= 3 || data->ignore_tx_num >= 3) {
+			if (val > pdata->ref_diff_threshold ||
+				val <= pdata->ref_diff_threshold / 2)
+				data->ref_diff_threshold = val + MAX_DIFF_MARGIN;
+			data->ignore_rx_num = 0;
+			data->ignore_tx_num = 0;
+		} else
+			data->ref_diff_threshold = val + MAX_DIFF_MARGIN;
+
+		dev_info(dev, "Max diff = %d\n", val);
+		dev_info(dev, "Last ref_diff_threshold = %d\n", (int)data->ref_diff_threshold);
+		data->is_ignore_channel_saved = true;
 	}
 
-	return error ? : count;
+	data->is_recalib_available = true;
+
+	i = 0;
+	while ((mxt_monitor_delta_no_calib_risk(data, DELTA_TYPE_MULT)
+			!= MONITOR_NO_RISK) &&
+		(mxt_monitor_delta_no_calib_risk(data, DELTA_TYPE_SELF)
+			!= MONITOR_NO_RISK)) {
+		msleep(100);
+		i ++;
+		if (i == 50)
+			break;
+	}
+
+	mxt_do_calibration(data);
 }
 
-static int mxt_get_diag_data(struct mxt_data *data, char *buf)
-{
-	struct device *dev = &data->client->dev;
-	int error;
-	int read_size = 0;
-	u16 addr = data->T37_address;
-
-	error = mxt_do_diagnostic(data, data->diag_mode);
-	if (error) {
-		dev_err(dev, "do diagnostic 0x%02x failed!\n", data->diag_mode);
-		return error;
-	}
-
-	while (read_size < MXT_DIAG_TOTAL_SIZE) {
-		error = mxt_read_reg(data->client, addr + 2,
-					MXT_DIAG_PAGE_SIZE, buf + read_size);
-		if (error) {
-			dev_err(dev, "Read from T37 failed!\n");
-			return error;
-		}
-
-		read_size += MXT_DIAG_PAGE_SIZE;
-
-		error = mxt_do_diagnostic(data, MXT_DIAG_PAGE_UP);
-		if (error) {
-			dev_err(dev, "do diagnostic 0x%02x failed!\n", MXT_DIAG_PAGE_UP);
-			return error;
-		}
-	}
-
-	if (data->debug_enabled)
-		print_hex_dump(KERN_DEBUG, "Data: ", DUMP_PREFIX_NONE, 16, 1,
-				       buf, MXT_DIAG_TOTAL_SIZE, false);
-
-	return 0;
-}
-
-static ssize_t mxt_diagnostic_show(struct device *dev,
-	struct device_attribute *attr, char *buf)
-{
-	struct mxt_data *data = dev_get_drvdata(dev);
-	int error;
-	int i = 0;
-	int len = 0;
-	int remain_size, transfer_size;
-	int row_size = 16;
-	int group_size = 1;
-	char *tmp_buffer = kmalloc(MXT_DIAG_TOTAL_SIZE, GFP_KERNEL);
-	if (tmp_buffer == NULL)
-		return -ENOMEM;
-
-	error = mxt_get_diag_data(data, tmp_buffer);
-	if (error) {
-		kfree(tmp_buffer);
-		return error;
-	}
-
-	remain_size = MXT_DIAG_TOTAL_SIZE % row_size;
-	transfer_size = MXT_DIAG_TOTAL_SIZE - remain_size;
-	while (i  < transfer_size) {
-		hex_dump_to_buffer(tmp_buffer + i, row_size, row_size, group_size,
-					buf + len, PAGE_SIZE - len, false);
-		i += row_size;
-		len = strlen(buf);
-		buf[len] = '\n';
-		len ++;
-	}
-
-	if (remain_size != 0)
-		hex_dump_to_buffer(tmp_buffer + i, remain_size, row_size, group_size,
-					buf + len, PAGE_SIZE - len, false);
-
-	kfree(tmp_buffer);
-	return strlen(buf);
-}
-
-static ssize_t mxt_diagnostic_store(struct device *dev,
+static ssize_t mxt_self_tune_store(struct device *dev,
 	struct device_attribute *attr, const char *buf, size_t count)
 {
+	u8 nv_backup;
 	struct mxt_data *data = dev_get_drvdata(dev);
-	int i;
-	u8 mode;
 
-	if (sscanf(buf, "%u", &i) == 1)  {
-		mode = (u8)i;
-		dev_info(dev, "Diag mode = 0x%02x\n", mode);
-		data->diag_mode = mode;
-	}
+	if (sscanf(buf, "%hhu", &nv_backup) == 1)
+		mxt_self_tune(data, nv_backup);
+	else
+		return -EINVAL;
 
 	return count;
-}
-
-static int mxt_chip_reset(struct mxt_data *data)
-{
-	int error;
-
-	disable_irq(data->client->irq);
-	if (gpio_is_valid(data->pdata->power_gpio))
-		gpio_set_value(data->pdata->power_gpio, 0);
-	else
-		mxt_initialize_regulator(data, false);
-	msleep(20);
-	if (gpio_is_valid(data->pdata->power_gpio))
-		gpio_set_value(data->pdata->power_gpio, 1);
-	else
-		mxt_initialize_regulator(data, true);
-	msleep(10);
-	mxt_wait_for_chg(data);
-	enable_irq(data->client->irq);
-	error = mxt_soft_reset(data, MXT_RESET_VALUE);
-	if (error)
-		return error;
-
-	error = mxt_initialize(data);
-
-	return error;
-}
-
-static ssize_t mxt_chip_reset_store(struct device *dev,
-				struct device_attribute *attr,
-				const char *buf, size_t count)
-{
-	int error;
-	struct mxt_data *data = dev_get_drvdata(dev);
-
-	error = mxt_chip_reset(data);
-	if (error)
-		return error;
-	else
-		return count;
-}
-
-static ssize_t mxt_chg_state_show(struct device *dev,
-	struct device_attribute *attr, char *buf)
-{
-	struct mxt_data *data = dev_get_drvdata(dev);
-	int count;
-	int chg_state;
-
-	chg_state = gpio_get_value(data->pdata->irq_gpio);
-	count = sprintf(buf, "%d\n", chg_state);
-
-	return count;
-}
-
-static ssize_t mxt_mem_access_read(struct file *filp, struct kobject *kobj,
-	struct bin_attribute *bin_attr, char *buf, loff_t off, size_t count)
-{
-	struct device *dev = container_of(kobj, struct device, kobj);
-	struct mxt_data *data = dev_get_drvdata(dev);
-	int ret = 0;
-
-	ret = mxt_check_mem_access_params(data, off, &count);
-	if (ret < 0)
-		return ret;
-
-	if (count > 0)
-		ret = mxt_read_reg(data->client, off, count, buf);
-
-	return ret == 0 ? count : ret;
-}
-
-static ssize_t mxt_mem_access_write(struct file *filp, struct kobject *kobj,
-	struct bin_attribute *bin_attr, char *buf, loff_t off,
-	size_t count)
-{
-	struct device *dev = container_of(kobj, struct device, kobj);
-	struct mxt_data *data = dev_get_drvdata(dev);
-	int ret = 0;
-
-	ret = mxt_check_mem_access_params(data, off, &count);
-	if (ret < 0)
-		return ret;
-
-	if (count > 0)
-		ret = mxt_write_block(data->client, off, count, buf);
-
-	return ret == 0 ? count : 0;
 }
 
 static int mxt_execute_golden_command(struct mxt_data *data, u8 cmd)
@@ -3246,10 +3769,11 @@ static int mxt_execute_golden_command(struct mxt_data *data, u8 cmd)
 	struct device *dev = &data->client->dev;
 	int error;
 	u8 ori_val = MXT_GOLDCTRL_ENABLE | MXT_GOLDCTRL_REPEN;
+
 	ori_val &= ~MXT_GOLD_CMD_MASK;
 	ori_val |= cmd;
 	error = mxt_write_object(data, MXT_SPT_GOLDENREF_T66,
-                                MXT_GOLDENREF_CTRL, ori_val);
+				MXT_GOLDENREF_CTRL, ori_val);
 	pr_info("write command = 0x%x\n", ori_val);
 	if (error) {
 		dev_err(dev, "Write object t66 error, when execute cmd 0x%x\n", cmd);
@@ -3269,16 +3793,25 @@ static int mxt_do_prepare_golden(struct mxt_data *data, bool dualx_on)
 	/* first close T8 anti-calib */
 	for (i = 0; i < sizeof(t8_close); i++) {
 		error = mxt_write_object(data, MXT_GEN_ACQUIRE_T8,
-				MXT_ACQUIRE_ATCHCALST+i, t8_close[i]);
+					MXT_ACQUIRE_ATCHCALST+i, t8_close[i]);
 		if (error) {
 			dev_err(dev, "Failed to close anti-calib\n");
 			return error;
 		}
 	}
 
+	/* Must enable both self sensing and mutual sensing*/
+	error = mxt_write_object(data, MXT_GEN_ACQUIRE_T8,
+					MXT_ACQUIRE_MEASALLOW,
+					MXT_MEASALLOW_MULT | MXT_MEASALLOW_SELT);
+	if (error) {
+		dev_err(dev, "Failed to close self-sensing!\n");
+		return error;
+	}
+
 	/* close the t66 en*/
 	error = mxt_write_object(data, MXT_SPT_GOLDENREF_T66,
-					MXT_GOLDENREF_CTRL, 0);
+				MXT_GOLDENREF_CTRL, 0);
 	if (error) {
 		dev_err(dev, "failed to disable t66!\n");
 		return error;
@@ -3286,7 +3819,7 @@ static int mxt_do_prepare_golden(struct mxt_data *data, bool dualx_on)
 
 	if (dualx_on) {
 		error = mxt_write_object(data, MXT_PROCG_NOISESUPPRESSION_T72,
-					MXT_NOISESUP_CALCFG, MXT_NOICFG_VNOISY);
+				MXT_NOISESUP_CALCFG, MXT_NOICFG_VNOISY);
 		if (error) {
 			dev_err(dev, "failed to enter very noisy mode!\n");
 			return error;
@@ -3296,7 +3829,7 @@ static int mxt_do_prepare_golden(struct mxt_data *data, bool dualx_on)
 	/* calib after t66 disabled, make sure the surface is flat */
 	mxt_do_calibration(data);
 
-        return 0;
+	return 0;
 }
 
 static int mxt_check_golden_status(struct mxt_data *data, bool dualx_on)
@@ -3308,22 +3841,23 @@ static int mxt_check_golden_status(struct mxt_data *data, bool dualx_on)
 
 	if (dualx_on) {
 		error = mxt_write_object(data, MXT_PROCG_NOISESUPPRESSION_T72,
-					MXT_NOISESUP_CALCFG, MXT_NOICFG_VNOISY);
+				MXT_NOISESUP_CALCFG, MXT_NOICFG_VNOISY);
 		if (error) {
 			dev_err(dev, "failed to enter very noisy mode!\n");
 			return error;
 		}
 	}
 
-	error = mxt_write_object(data, MXT_SPT_GOLDENREF_T66,MXT_GOLDENREF_CTRL,
-				MXT_GOLDCTRL_ENABLE | MXT_GOLDCTRL_REPEN);
+
+	error = mxt_write_object(data, MXT_SPT_GOLDENREF_T66,
+				MXT_GOLDENREF_CTRL, MXT_GOLDCTRL_ENABLE | MXT_GOLDCTRL_REPEN);
 	if (error) {
 		dev_err(dev, "failed to enable t66\n");
 		return error;
 	}
 
 	error = mxt_write_object(data, MXT_GEN_COMMAND_T6,
-                                MXT_COMMAND_REPORTALL, 1);
+				MXT_COMMAND_REPORTALL, 1);
 	if (error) {
 		dev_err(dev, "failed to report all msg!\n");
 		return error;
@@ -3345,6 +3879,69 @@ static int mxt_check_golden_status(struct mxt_data *data, bool dualx_on)
 
 	if (data->golden_msg.status & MXT_GOLDSTS_BADSTOREDATA)
 		return -EINVAL;
+
+	return 0;
+}
+
+static int mxt_do_curr_golden_ref_tune(struct mxt_data *data)
+{
+	struct device *dev = &data->client->dev;
+	bool is_sequence_done = false;
+	int k, j;
+	u8 status;
+	int time_out = 200;
+	int error;
+
+	data->golden_msg.status = MXT_GOLDSTATE_INVALID;
+	error = mxt_execute_golden_command(data, MXT_GOLDCMD_PRIME | MXT_GOLD_USECURR);
+	if (error) {
+		dev_err(dev, "execute command prime failed\n");
+		return error;
+	}
+
+	k = 0;
+	j = 0;
+	while (!is_sequence_done) {
+		mutex_lock(&data->golden_mutex);
+		if (data->golden_msg.status == MXT_GOLDSTATE_INVALID) {
+			if(k++ >= time_out) {
+				error = -ETIMEDOUT;
+				mutex_unlock(&data->golden_mutex);
+				return error;
+			}
+			mutex_unlock(&data->golden_mutex);
+			msleep(10);
+			continue;
+		}
+		k = 0;
+		dev_info(dev, "data->golden_msg.status = 0x%x\n", data->golden_msg.status);
+		status = data->golden_msg.status & MXT_GOLD_STATE_MASK;
+		if (status == MXT_GOLDSTATE_PRIME) {
+			error = mxt_execute_golden_command(data, MXT_GOLDCMD_GENERATE | MXT_GOLD_USECURR);
+			if (error) {
+				dev_err(dev, "execute command generate failed\n");
+				mutex_unlock(&data->golden_mutex);
+				return error;
+			}
+		} else if (data->golden_msg.status == MXT_GOLDSTATE_IDLE) {
+			error = mxt_execute_golden_command(data, MXT_GOLDCMD_NONE | MXT_GOLD_USECURR);
+			if (error) {
+				dev_err(dev, "execute command none failed\n");
+				mutex_unlock(&data->golden_mutex);
+				return error;
+			}
+			is_sequence_done = true;
+		} else {
+			error = mxt_execute_golden_command(data, MXT_GOLDCMD_PRIME | MXT_GOLD_USECURR);
+			if (error) {
+				dev_err(dev, "execute command prime failed\n");
+				mutex_unlock(&data->golden_mutex);
+				return error;
+			}
+		}
+		data->golden_msg.status = MXT_GOLDSTATE_INVALID;
+		mutex_unlock(&data->golden_mutex);
+	}
 
 	return 0;
 }
@@ -3460,7 +4057,7 @@ static int mxt_do_golden_ref_tune(struct mxt_data *data, bool dualx_on)
 }
 
 static ssize_t mxt_golden_ref_show(struct device *dev,
-        struct device_attribute *attr, char *buf)
+	struct device_attribute *attr, char *buf)
 {
 	struct mxt_data *data = dev_get_drvdata(dev);
 	int count;
@@ -3470,102 +4067,8 @@ static ssize_t mxt_golden_ref_show(struct device *dev,
 	return count;
 }
 
-#define DELTA_TYPE_MULT		0x1
-#define REF_TYPE_MULT		0x2
-#define MONITOR_HAS_RISK		0x0
-#define MONITOR_NO_RISK		0x1
-static int mxt_monitor_delta_no_calib_risk(struct mxt_data *data, u8 type)
-{
-	struct device *dev = &data->client->dev;
-	int error, i;
-	u16 addr = data->T37_address;
-	short val, no_touch_threshold, prev_val;
-	u8 *buf;
-	size_t buf_size;
-	u8 mode;
-	const struct mxt_platform_data *pdata = data->pdata;
-	int index = data->current_index;
-	int result = MONITOR_NO_RISK;
-	int read_size = 0;
-	int count = 0, row = 0;
-	short *ref_buf;
+#define TOTAL_TEST_NUM		3
 
-	if (type == DELTA_TYPE_MULT) {
-		buf_size = MXT_DIAG_TOTAL_SIZE;
-		mode = MXT_DIAG_MULT_DELTA;
-		no_touch_threshold = pdata->config_array[index].mult_no_touch_threshold;
-	} else if (type == REF_TYPE_MULT) {
-		buf_size = MXT_DIAG_TOTAL_SIZE;
-		mode = MXT_DIAG_MULT_REF;
-		ref_buf = (short*)kmalloc(sizeof(short) * (buf_size >> 1), GFP_KERNEL);
-		if (ref_buf == NULL)
-			return MONITOR_NO_RISK;
-	} else
-		return MONITOR_NO_RISK;
-
-	buf = kmalloc(buf_size, GFP_KERNEL);
-	if (buf == NULL) {
-		dev_err(dev, "Failed to alloc buffer for delta getting!\n");
-		return MONITOR_NO_RISK;
-	}
-
-	error = mxt_do_diagnostic(data, mode);
-	if (error) {
-		dev_err(dev, "Failed to send get diag data cmd!\n");
-		result = false;
-		goto end;
-	}
-
-	while (read_size < buf_size) {
-		error = mxt_read_reg(data->client, addr + 2,
-					MXT_DIAG_PAGE_SIZE, buf + read_size);
-		if (error) {
-			dev_err(dev, "Read from T37 failed!\n");
-			return error;
-		}
-
-		read_size += MXT_DIAG_PAGE_SIZE;
-
-		error = mxt_do_diagnostic(data, MXT_DIAG_PAGE_UP);
-		if (error) {
-			dev_err(dev, "do diagnostic 0x%02x failed!\n", MXT_DIAG_PAGE_UP);
-			return error;
-		}
-	}
-
-	for (i = 0; i < buf_size; i+= 2) {
-		val = (buf[i+1] << 8) | buf[i];
-		if (type == DELTA_TYPE_MULT) {
-			if (val > no_touch_threshold || val < -(no_touch_threshold))
-				result = MONITOR_HAS_RISK;
-		} else if (type == REF_TYPE_MULT) {
-			ref_buf[row * pdata->rx_num + count] = val;
-			count ++;
-			if (data->debug_enabled) {
-				if (count == 1)
-					printk(KERN_CONT "#### ");
-				printk(KERN_CONT "%5d ", val);
-			}
-
-			if (count == pdata->rx_num) {
-				if (data->debug_enabled)
-					printk(KERN_CONT "\n");
-				count = 0;
-				row ++;
-			}
-			prev_val = val;
-		}
-	}
-
-end:
-	if (type == REF_TYPE_MULT)
-		kfree(ref_buf);
-
-	kfree(buf);
-	return result;
-}
-
-#define TOTAL_TEST_NUM	3
 static bool mxt_is_golden_ref_good(struct mxt_data *data, bool dualx_on)
 {
 	int i;
@@ -3574,33 +4077,56 @@ static bool mxt_is_golden_ref_good(struct mxt_data *data, bool dualx_on)
 	if (dualx_on) {
 		int error;
 		error = mxt_write_object(data, MXT_PROCG_NOISESUPPRESSION_T72,
-					MXT_NOISESUP_CALCFG, MXT_NOICFG_VNOISY);
+				MXT_NOISESUP_CALCFG, MXT_NOICFG_VNOISY);
 		if (error) {
 			dev_err(dev, "failed to enter very noisy mode!\n");
 			return false;
 		}
-        }
+	}
 
 	msleep(100);
 
 	for (i = 0; i < TOTAL_TEST_NUM; i++) {
-		if (mxt_monitor_delta_no_calib_risk(data, DELTA_TYPE_MULT) !=
-						MONITOR_NO_RISK)
-			return false;
+			if (mxt_monitor_delta_no_calib_risk(data, DELTA_TYPE_MULT) !=
+				MONITOR_NO_RISK)
+				return false;
 			msleep(1000);
 	}
 
 	return true;
 }
 
+static void mxt_enable_golden_ref(struct mxt_data *data, bool enable)
+{
+	int error;
+	u8 val;
+	struct device *dev = &data->client->dev;
+
+	if (enable)
+		val = MXT_GOLDCTRL_ENABLE | MXT_GOLDCTRL_REPEN;
+	else
+		val = 0;
+
+	if (mxt_get_object(data, MXT_SPT_GOLDENREF_T66) == NULL) {
+			dev_err(dev, "No such object, ignore!\n");
+			return;
+	}
+
+	error = mxt_write_object(data, MXT_SPT_GOLDENREF_T66,
+				MXT_GOLDENREF_CTRL, val);
+	if (error)
+		dev_err(dev, "Failed to set golden_ref ctrl!\n");
+}
+
 static ssize_t mxt_golden_ref_store(struct device *dev,
-        struct device_attribute *attr, const char *buf, size_t count)
+	struct device_attribute *attr, const char *buf, size_t count)
 {
 	struct mxt_data *data = dev_get_drvdata(dev);
 	int error;
 	int val;
 
 	data->golden_ok = 0;
+	data->is_recalib_available = false;
 	sscanf(buf, "%u", &val);
 	mutex_lock(&data->input_dev->mutex);
 	if (val == 1) {
@@ -3608,6 +4134,7 @@ static ssize_t mxt_golden_ref_store(struct device *dev,
 		if (mxt_get_object(data, MXT_SPT_GOLDENREF_T66) == NULL) {
 			dev_err(dev, "No such object, ignore!\n");
 			mutex_unlock(&data->input_dev->mutex);
+			data->is_recalib_available = true;
 			return 0;
 		}
 
@@ -3631,16 +4158,594 @@ static ssize_t mxt_golden_ref_store(struct device *dev,
 			dev_err(dev, "dual-x detect failed!\n");
 	} else {
 		mutex_unlock(&data->input_dev->mutex);
+		data->is_recalib_available = true;
 		return -EINVAL;
 	}
 
 end:
 	mutex_unlock(&data->input_dev->mutex);
 	error = mxt_soft_reset(data, MXT_RESET_VALUE);
-	if (error)
-                return error;
+	if (error) {
+		data->is_recalib_available = true;
+		return error;
+	}
 	mxt_do_calibration(data);
+	data->is_recalib_available = true;
 	return count;
+}
+
+static ssize_t mxt_golden_en_store(struct device *dev,
+	struct device_attribute *attr, const char *buf, size_t count)
+{
+	struct mxt_data *data = dev_get_drvdata(dev);
+	int val;
+
+	sscanf(buf, "%u", &val);
+	mxt_enable_golden_ref(data, (bool)val);
+	data->gr_enable = (bool)val;
+
+	return count;
+}
+
+static ssize_t mxt_update_fw_flag_store(struct device *dev,
+	struct device_attribute *attr, const char *buf, size_t count)
+{
+	struct mxt_data *data = dev_get_drvdata(dev);
+	int ret = 0;
+	int i;
+
+	if (sscanf(buf, "%u", &i) == 1)  {
+		dev_dbg(dev, "write fw update flag %d to t38\n", i);
+		ret = mxt_write_object(data, MXT_SPT_USERDATA_T38,
+					MXT_FW_UPDATE_FLAG, (u8)i);
+		if (ret < 0)
+			return ret;
+		ret = mxt_backup_nv(data);
+		if (ret)
+			return ret;
+	}
+
+	return count;
+}
+
+static ssize_t mxt_selftest_show(struct device *dev,
+	struct device_attribute *attr, char *buf)
+{
+	struct mxt_data *data = dev_get_drvdata(dev);
+	return sprintf(buf, "%02x, %02x, %02x, %02x, %02x, %02x\n",
+			data->test_result[0], data->test_result[1],
+			data->test_result[2], data->test_result[3],
+			data->test_result[4], data->test_result[5]);
+}
+
+static ssize_t mxt_selftest_store(struct device *dev,
+	struct device_attribute *attr, const char *buf, size_t count)
+{
+	struct mxt_data *data = dev_get_drvdata(dev);
+	int error;
+	u8 selftest_cmd;
+
+	/* run all selftest */
+	error = mxt_write_object(data,
+			MXT_SPT_SELFTEST_T25,
+			0x01, 0xfe);
+	if (!error) {
+		while (true) {
+			msleep(10);
+			error = mxt_read_object(data,
+					MXT_SPT_SELFTEST_T25,
+					0x01, &selftest_cmd);
+			if (error || selftest_cmd == 0)
+				break;
+		}
+	}
+
+	return error ? : count;
+}
+
+static int mxt_stylus_mode_switch(struct mxt_data *data, bool mode_on)
+{
+	struct device *dev = &data->client->dev;
+	const struct mxt_platform_data *pdata = data->pdata;
+	int error;
+	u8 ctrl;
+	u8 mult_intthr;
+	u8 mult_tchthr;
+	int index = data->current_index;
+
+	error = mxt_read_object(data, MXT_PROCI_STYLUS_T47,
+					MXT_PSTYLUS_CTRL, &ctrl);
+	if (error) {
+		dev_err(dev, "Failed to read from T47!\n");
+		return error;
+	}
+
+	if (mode_on) {
+		ctrl |= MXT_PSTYLUS_ENABLE;
+		mult_intthr = pdata->config_array[index].mult_intthr_sensitive;
+		mult_tchthr = pdata->config_array[index].mult_tchthr_sensitive;
+	}
+	else {
+		ctrl &= ~(MXT_PSTYLUS_ENABLE);
+		if (!data->sensitive_mode) {
+			mult_intthr = pdata->config_array[index].mult_intthr_not_sensitive;
+			mult_tchthr = pdata->config_array[index].mult_tchthr_not_sensitive;
+		}
+		else {
+			mult_intthr = pdata->config_array[index].mult_intthr_sensitive;
+			mult_tchthr = pdata->config_array[index].mult_tchthr_sensitive;
+		}
+	}
+
+	mxt_adjust_self_setting(data, ctrl & MXT_PSTYLUS_ENABLE,
+				TYPE_SELF_INTTHR_STYLUS);
+	error = mxt_write_object(data, MXT_PROCI_STYLUS_T47,
+			MXT_PSTYLUS_CTRL, ctrl);
+	if (error) {
+		dev_err(dev, "Failed to read from t47!\n");
+		return error;
+	}
+
+	error = mxt_write_object(data, MXT_TOUCH_MULTI_T100,
+					MXT_MULTITOUCH_INTTHR, mult_intthr);
+	if (error) {
+		dev_err(dev, "Failed in writing t100 intthr!\n");
+		return error;
+	}
+
+	if (mult_tchthr != 0) {
+		error = mxt_write_object(data, MXT_TOUCH_MULTI_T100,
+						MXT_MULTITOUCH_TCHTHR, mult_tchthr);
+		if (error) {
+			dev_err(dev, "Failed in writing t100 tchthr!\n");
+			return error;
+		}
+
+		error = mxt_write_object(data, MXT_SPT_DYMDATA_T71,
+						pdata->config_array[index].t71_tchthr_pos, mult_tchthr);
+		if (error) {
+			dev_err(dev, "Failed in writing t71 tchthr!\n");
+			return error;
+		}
+	}
+
+	data->stylus_mode = (u8)mode_on;
+	return 0;
+}
+
+static ssize_t mxt_stylus_show(struct device *dev,
+	struct device_attribute *attr, char *buf)
+{
+	struct mxt_data *data = dev_get_drvdata(dev);
+	int count;
+
+	count = sprintf(buf, "%d\n", (int)data->stylus_mode);
+
+	return count;
+}
+
+static ssize_t mxt_stylus_store(struct device *dev,
+	struct device_attribute *attr, const char *buf, size_t count)
+{
+	struct mxt_data *data = dev_get_drvdata(dev);
+	int error, i;
+
+	if (sscanf(buf, "%u", &i) == 1)  {
+		if (i == 1) {
+			error = mxt_stylus_mode_switch(data, true);
+			if (error) {
+				dev_err(dev, "Failed to enable stylus mode!\n");
+				return error;
+			}
+		}
+		else if (i == 0) {
+			error = mxt_stylus_mode_switch(data, false);
+			if (error) {
+				dev_err(dev, "Failed to disable stylus mode!\n");
+				return error;
+			}
+		}
+		else
+			return -EINVAL;
+
+	}
+
+	return count;
+}
+
+static int mxt_get_diag_data(struct mxt_data *data, char *buf)
+{
+	struct device *dev = &data->client->dev;
+	int error;
+	int read_size = 0;
+	u16 addr = data->T37_address;
+
+	error = mxt_do_diagnostic(data, data->diag_mode);
+	if (error) {
+		dev_err(dev, "do diagnostic 0x%02x failed!\n", data->diag_mode);
+		return error;
+	}
+
+	while (read_size < MXT_DIAG_TOTAL_SIZE) {
+		error = mxt_read_reg(data->client, addr + 2,
+					MXT_DIAG_PAGE_SIZE, buf + read_size);
+		if (error) {
+			dev_err(dev, "Read from T37 failed!\n");
+			return error;
+		}
+
+		read_size += MXT_DIAG_PAGE_SIZE;
+
+		error = mxt_do_diagnostic(data, MXT_DIAG_PAGE_UP);
+		if (error) {
+			dev_err(dev, "do diagnostic 0x%02x failed!\n", MXT_DIAG_PAGE_UP);
+			return error;
+		}
+	}
+
+	if (data->debug_enabled)
+		print_hex_dump(KERN_DEBUG, "Data: ", DUMP_PREFIX_NONE, 16, 1,
+				       buf, MXT_DIAG_TOTAL_SIZE, false);
+
+	return 0;
+}
+
+static ssize_t mxt_diagnostic_show(struct device *dev,
+	struct device_attribute *attr, char *buf)
+{
+	struct mxt_data *data = dev_get_drvdata(dev);
+	int error;
+	int i = 0;
+	int len = 0;
+	int remain_size, transfer_size;
+	int row_size = 16;
+	int group_size = 1;
+	char *tmp_buffer = kmalloc(MXT_DIAG_TOTAL_SIZE, GFP_KERNEL);
+	if (tmp_buffer == NULL)
+		return -ENOMEM;
+
+	error = mxt_get_diag_data(data, tmp_buffer);
+	if (error) {
+		kfree(tmp_buffer);
+		return error;
+	}
+
+	remain_size = MXT_DIAG_TOTAL_SIZE % row_size;
+	transfer_size = MXT_DIAG_TOTAL_SIZE - remain_size;
+	while (i  < transfer_size) {
+		hex_dump_to_buffer(tmp_buffer + i, row_size, row_size, group_size,
+					buf + len, PAGE_SIZE - len, false);
+		i += row_size;
+		len = strlen(buf);
+		buf[len] = '\n';
+		len ++;
+	}
+
+	if (remain_size != 0)
+		hex_dump_to_buffer(tmp_buffer + i, remain_size, row_size, group_size,
+					buf + len, PAGE_SIZE - len, false);
+
+	kfree(tmp_buffer);
+	return strlen(buf);
+}
+
+static ssize_t mxt_diagnostic_store(struct device *dev,
+	struct device_attribute *attr, const char *buf, size_t count)
+{
+	struct mxt_data *data = dev_get_drvdata(dev);
+	int i;
+	u8 mode;
+
+	if (sscanf(buf, "%u", &i) == 1)  {
+		mode = (u8)i;
+		dev_info(dev, "Diag mode = 0x%02x\n", mode);
+		data->diag_mode = mode;
+	}
+
+	return count;
+}
+
+static void mxt_update_noise_mode(struct mxt_data *data)
+{
+	int error;
+	struct device *dev = &data->client->dev;
+	u8 noise_ctrl;
+	const struct mxt_platform_data *pdata = data->pdata;
+	u8 *linearity_reg_pos = pdata->linearity_reg_pos;
+	u8 *linearity_array;
+	int i;
+
+	if (data->sensitive_mode) {
+		error = mxt_read_object(data, MXT_PROCG_NOISESUPPRESSION_T72,
+					MXT_NOISESUP_CFG1, &noise_ctrl);
+		if (error) {
+			dev_err(dev, "Failed in reading from T72!\n");
+			return;
+		}
+
+		if (noise_ctrl != MXT_NOICFG_NOISY) {
+			error = mxt_write_object(data, MXT_PROCG_NOISESUPPRESSION_T72,
+						MXT_NOISESUP_CFG1, MXT_NOICFG_NOISY);
+			if (error) {
+				dev_err(dev, "Failed in writing to T72!\n");
+				return;
+			}
+		}
+		linearity_array = pdata->linearity_dualx;
+	} else {
+		error = mxt_write_object(data, MXT_PROCG_NOISESUPPRESSION_T72,
+					MXT_NOISESUP_CFG1, 0);
+		if (error) {
+			dev_err(dev, "Failed in writing to T72!\n");
+			return;
+		}
+		linearity_array = pdata->linearity_singlex;
+	}
+
+	for (i = 0; i < pdata->linearity_para_num; i++) {
+		error = mxt_write_object(data, MXT_TOUCH_MULTI_T100,
+					linearity_reg_pos[i], linearity_array[i]);
+		if (error) {
+			dev_err(dev, "Failed in writing to T100!\n");
+			return;
+		}
+	}
+}
+
+static int mxt_sensitive_mode_switch(struct mxt_data *data, bool mode_on)
+{
+	int error;
+	struct device *dev = &data->client->dev;
+	const struct mxt_platform_data *pdata = data->pdata;
+	int index = data->current_index;
+	u8 key_ctrl;
+	u8 mult_intthr;
+	u8 atchthr;
+	u8 mult_tchthr;
+
+	error = mxt_read_object(data, MXT_TOUCH_KEYARRAY_T15,
+					MXT_KEYARRAY_CTRL, &key_ctrl);
+	if (error) {
+		dev_err(dev, "Failed to read from T15 ctrl!\n");
+		return error;
+	}
+
+	if (mode_on) {
+		error = mxt_write_object(data, MXT_PROCI_GLOVEDETECTION_T78,
+						MXT_GLOVE_CTRL, MXT_GLOVECTL_ALL_ENABLE);
+		if (error)
+			return error;
+
+		key_ctrl |= MXT_KEY_ADAPTTHREN;
+		mult_intthr = pdata->config_array[index].mult_intthr_sensitive;
+		mult_tchthr = pdata->config_array[index].mult_tchthr_sensitive;
+		atchthr = pdata->config_array[index].atchthr_sensitive;
+	} else {
+		error = mxt_write_object(data, MXT_PROCI_GLOVEDETECTION_T78,
+						MXT_GLOVE_CTRL, 0x0);
+		if (error)
+			return error;
+
+		key_ctrl &= (~MXT_KEY_ADAPTTHREN);
+		if (!data->stylus_mode) {
+			mult_intthr = pdata->config_array[index].mult_intthr_not_sensitive;
+			mult_tchthr = pdata->config_array[index].mult_tchthr_not_sensitive;
+		}
+		else {
+			mult_intthr = pdata->config_array[index].mult_intthr_sensitive;
+			mult_tchthr = pdata->config_array[index].mult_tchthr_sensitive;
+		}
+		atchthr = data->atchthr;
+	}
+
+	error = mxt_write_object(data, MXT_PROCI_RETRANSMISSIONCOMPENSATION_T80,
+					MXT_RETRANS_ATCHTHR, atchthr);
+	if (error) {
+		dev_err(dev, "Failed in writing t80 atchthr!\n");
+		return error;
+	}
+
+	error = mxt_write_object(data, MXT_TOUCH_MULTI_T100,
+					MXT_MULTITOUCH_INTTHR, mult_intthr);
+	if (error) {
+		dev_err(dev, "Failed in writing t100 intthr!\n");
+		return error;
+	}
+	if (mult_tchthr != 0) {
+		error = mxt_write_object(data, MXT_TOUCH_MULTI_T100,
+						MXT_MULTITOUCH_TCHTHR, mult_tchthr);
+		if (error) {
+			dev_err(dev, "Failed in writing t100 tchthr!\n");
+			return error;
+		}
+
+		error = mxt_write_object(data, MXT_SPT_DYMDATA_T71,
+						pdata->config_array[index].t71_tchthr_pos, mult_tchthr);
+		if (error) {
+			dev_err(dev, "Failed in writing t71 tchthr!\n");
+			return error;
+		}
+	}
+
+	error = mxt_write_object(data, MXT_TOUCH_KEYARRAY_T15,
+					MXT_KEYARRAY_CTRL, key_ctrl);
+	if (error) {
+		dev_err(dev, "Failed in writing t15 key ctrl!\n");
+		return error;
+	}
+
+	data->sensitive_mode = (u8)mode_on;
+	mxt_update_noise_mode(data);
+
+	return error;
+}
+
+static ssize_t mxt_sensitive_mode_show(struct device *dev,
+	struct device_attribute *attr, char *buf)
+{
+	struct mxt_data *data = dev_get_drvdata(dev);
+	int count;
+
+	count = sprintf(buf, "%d\n", (int)data->sensitive_mode);
+
+	return count;
+}
+
+static ssize_t  mxt_sensitive_mode_store(struct device *dev,
+				struct device_attribute *attr,
+				const char *buf, size_t count)
+{
+	struct mxt_data *data = dev_get_drvdata(dev);
+	unsigned long val;
+	int error;
+
+	error = strict_strtoul(buf, 0, &val);
+	if (!error) {
+		if (val == 1) {
+			error = mxt_sensitive_mode_switch(data, true);
+			if (error)
+				dev_err(dev, "Failed to open sensitive mode!\n");
+		} else if (val == 0) {
+			error = mxt_sensitive_mode_switch(data, false);
+			if (error)
+				dev_err(dev, "Failed to close sensitive mode!\n");
+		}
+	}
+
+	return error ? : count;
+}
+
+static int mxt_chip_reset(struct mxt_data *data)
+{
+	int error;
+
+	gpio_set_value(data->pdata->power_gpio, 0);
+	msleep(20);
+	gpio_set_value(data->pdata->power_gpio, 1);
+	msleep(10);
+	mxt_wait_for_chg(data);
+
+	data->is_recalib_available = false;
+	error = mxt_initialize(data);
+
+	queue_work(data->work_queue, &data->pre_use_work);
+
+	return error;
+}
+
+static ssize_t mxt_chip_reset_store(struct device *dev,
+				struct device_attribute *attr,
+				const char *buf, size_t count)
+{
+	int error;
+	struct mxt_data *data = dev_get_drvdata(dev);
+
+	error = mxt_chip_reset(data);
+	if (error)
+		return error;
+	else
+		return count;
+}
+
+static ssize_t mxt_chg_state_show(struct device *dev,
+	struct device_attribute *attr, char *buf)
+{
+	struct mxt_data *data = dev_get_drvdata(dev);
+	int count;
+	int chg_state;
+
+	chg_state = gpio_get_value(data->pdata->irq_gpio);
+	count = sprintf(buf, "%d\n", chg_state);
+
+	return count;
+}
+
+static void mxt_switch_mode_work(struct work_struct *work)
+{
+	struct mxt_mode_switch *ms = container_of(work, struct mxt_mode_switch, switch_mode_work);
+	struct mxt_data *data = ms->data;
+	u8 value = ms->mode;
+
+	if (value == MXT_INPUT_EVENT_SENSITIVE_MODE_ON ||
+				value == MXT_INPUT_EVENT_SENSITIVE_MODE_OFF) {
+		mxt_sensitive_mode_switch(data, (bool)(value - MXT_INPUT_EVENT_SENSITIVE_MODE_OFF));
+	}
+	else if (value == MXT_INPUT_EVENT_STYLUS_MODE_ON ||
+				value == MXT_INPUT_EVENT_STYLUS_MODE_OFF) {
+		mxt_stylus_mode_switch(data, (bool)(value - MXT_INPUT_EVENT_STYLUS_MODE_OFF));
+	}
+
+	if (ms != NULL) {
+		kfree(ms);
+		ms = NULL;
+	}
+}
+
+static int mxt_input_event(struct input_dev *dev,
+		unsigned int type, unsigned int code, int value)
+{
+	struct mxt_data *data = input_get_drvdata(dev);
+	char buffer[16];
+	struct mxt_mode_switch *ms;
+
+	if (type == EV_SYN && code == SYN_CONFIG) {
+		if (data->debug_enabled) {
+			dev_info(&data->client->dev,
+				"event write value = %d \n", value);
+		}
+		sprintf(buffer, "%d", value);
+
+		if (value >= MXT_INPUT_EVENT_START && value <= MXT_INPUT_EVENT_END) {
+			ms = (struct mxt_mode_switch*)kmalloc(sizeof(struct mxt_mode_switch), GFP_ATOMIC);
+			if (ms != NULL) {
+				ms->data = data;
+				ms->mode = (u8)value;
+				INIT_WORK(&ms->switch_mode_work, mxt_switch_mode_work);
+				schedule_work(&ms->switch_mode_work);
+			} else {
+				dev_err(&data->client->dev,
+					"Failed in allocating memory for mxt_mode_switch!\n");
+				return -ENOMEM;
+			}
+		}
+	}
+
+	return 0;
+}
+
+static ssize_t mxt_mem_access_read(struct file *filp, struct kobject *kobj,
+	struct bin_attribute *bin_attr, char *buf, loff_t off, size_t count)
+{
+	struct device *dev = container_of(kobj, struct device, kobj);
+	struct mxt_data *data = dev_get_drvdata(dev);
+	int ret = 0;
+
+	ret = mxt_check_mem_access_params(data, off, &count);
+	if (ret < 0)
+		return ret;
+
+	if (count > 0)
+		ret = mxt_read_reg(data->client, off, count, buf);
+
+	return ret == 0 ? count : ret;
+}
+
+static ssize_t mxt_mem_access_write(struct file *filp, struct kobject *kobj,
+	struct bin_attribute *bin_attr, char *buf, loff_t off,
+	size_t count)
+{
+	struct device *dev = container_of(kobj, struct device, kobj);
+	struct mxt_data *data = dev_get_drvdata(dev);
+	int ret = 0;
+
+	ret = mxt_check_mem_access_params(data, off, &count);
+	if (ret < 0)
+		return ret;
+
+	if (count > 0)
+		ret = mxt_write_block(data->client, off, count, buf);
+
+	return ret == 0 ? count : 0;
 }
 
 static DEVICE_ATTR(update_fw, S_IWUSR | S_IRUSR, mxt_update_fw_show, mxt_update_fw_store);
@@ -3652,12 +4757,16 @@ static DEVICE_ATTR(version, S_IRUGO, mxt_version_show, NULL);
 static DEVICE_ATTR(build, S_IRUGO, mxt_build_show, NULL);
 static DEVICE_ATTR(slowscan_enable, S_IWUSR | S_IRUSR,
 			mxt_slowscan_show, mxt_slowscan_store);
+static DEVICE_ATTR(self_tune, S_IWUSR, NULL, mxt_self_tune_store);
+static DEVICE_ATTR(golden_ref, S_IWUSR | S_IRUSR, mxt_golden_ref_show, mxt_golden_ref_store);
+static DEVICE_ATTR(golden_en, S_IWUSR, NULL, mxt_golden_en_store);
 static DEVICE_ATTR(update_fw_flag, S_IWUSR, NULL, mxt_update_fw_flag_store);
 static DEVICE_ATTR(selftest,  S_IWUSR | S_IRUSR, mxt_selftest_show, mxt_selftest_store);
+static DEVICE_ATTR(stylus, S_IWUSR | S_IRUSR, mxt_stylus_show, mxt_stylus_store);
 static DEVICE_ATTR(diagnostic, S_IWUSR | S_IRUSR, mxt_diagnostic_show, mxt_diagnostic_store);
+static DEVICE_ATTR(sensitive_mode, S_IWUSR | S_IRUSR, mxt_sensitive_mode_show, mxt_sensitive_mode_store);
 static DEVICE_ATTR(chip_reset, S_IWUSR, NULL, mxt_chip_reset_store);
 static DEVICE_ATTR(chg_state, S_IRUGO, mxt_chg_state_show, NULL);
-static DEVICE_ATTR(golden_ref, S_IWUSR | S_IRUSR, mxt_golden_ref_show, mxt_golden_ref_store);
 
 static struct attribute *mxt_attrs[] = {
 	&dev_attr_update_fw.attr,
@@ -3666,18 +4775,52 @@ static struct attribute *mxt_attrs[] = {
 	&dev_attr_version.attr,
 	&dev_attr_build.attr,
 	&dev_attr_slowscan_enable.attr,
+	&dev_attr_self_tune.attr,
+	&dev_attr_golden_ref.attr,
+	&dev_attr_golden_en.attr,
 	&dev_attr_update_fw_flag.attr,
 	&dev_attr_selftest.attr,
+	&dev_attr_stylus.attr,
 	&dev_attr_diagnostic.attr,
+	&dev_attr_sensitive_mode.attr,
 	&dev_attr_chip_reset.attr,
 	&dev_attr_chg_state.attr,
-	&dev_attr_golden_ref.attr,
 	NULL
 };
 
 static const struct attribute_group mxt_attr_group = {
 	.attrs = mxt_attrs,
 };
+
+static bool mxt_read_and_check_calib_msg(struct mxt_data *data)
+{
+	int ret;
+	int i = 0;
+	struct device *dev = &data->client->dev;
+	bool is_calib_msg_exists = false;
+
+	while (true) {
+		ret = mxt_read_reg(data->client, data->T5_address,
+				data->T5_msg_size, data->msg_buf);
+		if (ret) {
+			dev_err(dev, "Failed to read %d messages (%d)\n", i, ret);
+			return false;
+		}
+
+		if (data->msg_buf[0] == MXT_RPTID_NOMSG)
+			break;
+
+		print_hex_dump(KERN_DEBUG, "MXT MSG:", DUMP_PREFIX_NONE, 16, 1,
+				data->msg_buf, data->T5_msg_size, false);
+		if ((data->msg_buf[0] == data->T6_reportid) &&
+			(data->msg_buf[1] & MXT_STATUS_CAL))
+			is_calib_msg_exists = true;
+		i ++;
+	}
+
+	return is_calib_msg_exists;
+
+}
 
 static void mxt_start(struct mxt_data *data)
 {
@@ -3691,11 +4834,10 @@ static void mxt_start(struct mxt_data *data)
 	if (error)
 		return;
 
-	/* At this point, it may be necessary to clear state
-	 * by disabling/re-enabling the noise suppression object */
-
-	/* Recalibrate since chip has been in deep sleep */
-	mxt_do_calibration(data);
+	if (mxt_read_and_check_calib_msg(data))
+		queue_delayed_work(data->work_queue, &data->update_setting_delayed_work, HZ);
+	else
+		mxt_do_calibration(data);
 
 	dev_dbg(dev, "MXT started\n");
 }
@@ -3748,11 +4890,20 @@ static void mxt_clear_touch_event(struct mxt_data *data)
 
 static int mxt_suspend(struct device *dev)
 {
+	int ret;
 	struct i2c_client *client = to_i2c_client(dev);
 	struct mxt_data *data = i2c_get_clientdata(client);
 	struct input_dev *input_dev = data->input_dev;
 
 	disable_irq(client->irq);
+
+	data->safe_count = 0;
+	cancel_delayed_work_sync(&data->update_setting_delayed_work);
+	cancel_delayed_work_sync(&data->disable_anticalib_delayed_work);
+	mxt_adjust_self_setting(data, true, TYPE_SELF_THR);
+	mxt_adjust_self_setting(data, true, TYPE_SELF_INTTHR_SUSPEND);
+	mxt_anti_calib_control(data, true);
+	mxt_self_recalib_control(data, true);
 
 	mutex_lock(&input_dev->mutex);
 
@@ -3763,16 +4914,44 @@ static int mxt_suspend(struct device *dev)
 
 	mxt_clear_touch_event(data);
 
+	if (data->regulator_vdd && data->regulator_avdd) {
+		ret = regulator_disable(data->regulator_avdd);
+		if (ret < 0) {
+			dev_err(dev,
+			"Atmel regulator disable for avdd failed: %d\n", ret);
+		}
+		ret = regulator_disable(data->regulator_vdd);
+		if (ret < 0) {
+			dev_err(dev,
+			"Atmel regulator disable for vdd failed: %d\n", ret);
+		}
+	}
+
+	data->land_signed = 0;
+	data->self_restore_done = 0;
+
 	return 0;
 }
 
 static int mxt_resume(struct device *dev)
 {
+	int ret;
 	struct i2c_client *client = to_i2c_client(dev);
 	struct mxt_data *data = i2c_get_clientdata(client);
 	struct input_dev *input_dev = data->input_dev;
 
-	enable_irq(client->irq);
+	if (data->regulator_vdd && data->regulator_avdd) {
+		ret = regulator_enable(data->regulator_vdd);
+		if (ret < 0) {
+			dev_err(dev,
+			"Atmel regulator enable for vdd failed: %d\n", ret);
+		}
+		ret = regulator_enable(data->regulator_avdd);
+		if (ret < 0) {
+			dev_err(dev,
+			"Atmel regulator enable for avdd failed: %d\n", ret);
+		}
+	}
 
 	mutex_lock(&input_dev->mutex);
 
@@ -3780,6 +4959,8 @@ static int mxt_resume(struct device *dev)
 		mxt_start(data);
 
 	mutex_unlock(&input_dev->mutex);
+
+	enable_irq(client->irq);
 
 	return 0;
 }
@@ -3815,7 +4996,6 @@ static int mxt_initialize_input_device(struct mxt_data *data)
 	int ret;
 	int i;
 	int index = data->current_index;
-	bool t100_exists;
 
 	/* Initialize input device */
 	input_dev = input_allocate_device();
@@ -3837,48 +5017,33 @@ static int mxt_initialize_input_device(struct mxt_data *data)
 	input_dev->enable = mxt_input_enable;
 	input_dev->disable = mxt_input_disable;
 	input_dev->enabled = true;
+	input_dev->event = mxt_input_event;
 
 	__set_bit(EV_ABS, input_dev->evbit);
 	__set_bit(EV_KEY, input_dev->evbit);
 	__set_bit(INPUT_PROP_DIRECT, input_dev->propbit);
 
-	if (mxt_get_object(data, MXT_TOUCH_MULTI_T100) != NULL)
-		t100_exists = true;
-
 	/* For multi touch */
 	input_mt_init_slots(input_dev,
 		data->num_touchids + data->num_stylusids);
-	if (t100_exists) {
-		if (data->t100_tchaux_bits & MXT_T100_AREA) {
-			dev_info(dev, "report area\n");
-			input_set_abs_params(input_dev, ABS_MT_TOUCH_MAJOR,
-					     0, MXT_MAX_AREA, 0, 0);
-		}
-	} else
+	if (data->t100_tchaux_bits &  MXT_T100_AREA) {
+		dev_info(dev, "report area\n");
 		input_set_abs_params(input_dev, ABS_MT_TOUCH_MAJOR,
-					0, MXT_MAX_AREA, 0, 0);
-
+				     0, MXT_MAX_AREA, 0, 0);
+	}
 	input_set_abs_params(input_dev, ABS_MT_POSITION_X,
 			     0, data->max_x, 0, 0);
 	input_set_abs_params(input_dev, ABS_MT_POSITION_Y,
 			     0, data->max_y, 0, 0);
-
-	if (t100_exists) {
-		if (data->t100_tchaux_bits &  MXT_T100_AMPL) {
-			dev_info(dev, "report pressure\n");
-			input_set_abs_params(input_dev, ABS_MT_PRESSURE,
-					     0, 255, 0, 0);
-		}
-		if (data->t100_tchaux_bits &  MXT_T100_VECT) {
-			dev_info(dev, "report vect\n");
-			input_set_abs_params(input_dev, ABS_MT_ORIENTATION,
-				     0, 255, 0, 0);
-		}
-	} else {
+	if (data->t100_tchaux_bits &  MXT_T100_AMPL) {
+		dev_info(dev, "report pressure\n");
 		input_set_abs_params(input_dev, ABS_MT_PRESSURE,
-					0, 255, 0, 0);
+				     0, 255, 0, 0);
+	}
+	if (data->t100_tchaux_bits &  MXT_T100_VECT) {
+		dev_info(dev, "report vect\n");
 		input_set_abs_params(input_dev, ABS_MT_ORIENTATION,
-					0, 255, 0, 0);
+				     0, 255, 0, 0);
 	}
 
 	/* For T63 active stylus */
@@ -4038,7 +5203,13 @@ static void mxt_dump_value(struct device *dev, struct mxt_platform_data *pdata)
 
 	dev_info(dev, "reset gpio= %d\n", pdata->reset_gpio);
 	dev_info(dev, "irq gpio= %d\n", pdata->irq_gpio);
+	dev_info(dev, "power gpio= %d\n", pdata->power_gpio);
 	dev_info(dev, "fw name = %s\n", pdata->mxt_fw_name);
+	dev_info(dev, "unlock move threshold= %d\n", pdata->unlock_move_threshold);
+	dev_info(dev, "landing threshold= %d\n", pdata->landing_threshold);
+	dev_info(dev, "landing edge threshold= %d\n", pdata->landing_edge_threshold);
+	dev_info(dev, "staying threshold= %d\n", pdata->staying_threshold);
+	dev_info(dev, "jiffies= %ld\n", pdata->landing_jiffies);
 	dev_info(dev, "config size = %d\n", pdata->config_array_size);
 	dev_info(dev, "gpio mask = 0x%x\n", pdata->gpio_mask);
 
@@ -4059,8 +5230,10 @@ static int mxt_parse_dt(struct device *dev, struct mxt_platform_data *pdata)
 	struct mxt_config_info *info;
 	struct device_node *temp, *np = dev->of_node;
 	u32 temp_val;
-
-	pdata->i2c_pull_up = of_property_read_bool(np, "atmel,i2c-pull-up");
+	int *linearity_reg_pos;
+	int *linearity_singlex;
+	int *linearity_dualx;
+	int i;
 
 	/* reset, irq, power gpio info */
 	pdata->reset_gpio = of_get_named_gpio_flags(np, "atmel,reset-gpio",
@@ -4069,7 +5242,6 @@ static int mxt_parse_dt(struct device *dev, struct mxt_platform_data *pdata)
 				0, &pdata->irq_gpio_flags);
 	pdata->power_gpio = of_get_named_gpio_flags(np, "atmel,power-gpio",
 				0, &pdata->power_gpio_flags);
-
 	ret = of_property_read_u32(np, "atmel,irqflags", &temp_val);
 	if (ret) {
 		dev_err(dev, "Unable to read irqflags id\n");
@@ -4084,11 +5256,86 @@ static int mxt_parse_dt(struct device *dev, struct mxt_platform_data *pdata)
 		return ret;
 	}
 
+	ret = of_property_read_u32(np, "atmel,unlock-move-threshold", &pdata->unlock_move_threshold);
+	if (ret)
+		dev_err(dev, "Unable to read unlock move threshold\n");
+
+	ret = of_property_read_u32(np, "atmel,staying-threshold", &pdata->staying_threshold);
+	if (ret)
+		dev_err(dev, "Unable to read staying threshold\n");
+
+	ret = of_property_read_u32(np, "atmel,landing-threshold", &pdata->landing_threshold);
+	if (ret)
+		dev_err(dev, "Unable to read landing threshold\n");
+
+	ret = of_property_read_u32(np, "atmel,landing-edge-threshold", &pdata->landing_edge_threshold);
+	if (ret)
+		dev_err(dev, "Unable to read landing edge threshold\n");
+
+	ret = of_property_read_u32(np, "atmel,landing-jiffies", (u32*)&pdata->landing_jiffies);
+	if (ret)
+		dev_err(dev, "Unable to read landing jiffies\n");
+
+	ret = of_property_read_u32(np, "atmel,edge-clip", (u32*)&pdata->edge_clip);
+	if (ret)
+		dev_err(dev, "Unable to read edge clip\n");
+
 	ret = of_property_read_u32(np, "atmel,gpio-mask", (u32*)&temp_val);
 	if (ret)
 		dev_err(dev, "Unable to read gpio mask\n");
 	else
 		pdata->gpio_mask = (u8)temp_val;
+
+	ret = of_property_read_u32(np, "atmel,linearity-para-num", (u32*)&temp_val);
+	if (ret)
+		dev_err(dev, "Unable to read linearity para num\n");
+
+	linearity_reg_pos = devm_kzalloc(dev, sizeof(int) * temp_val, GFP_KERNEL);
+	if (!linearity_reg_pos)
+		return -ENOMEM;
+	linearity_singlex = devm_kzalloc(dev, sizeof(int) * temp_val, GFP_KERNEL);
+	if (!linearity_singlex)
+		return -ENOMEM;
+	linearity_dualx = devm_kzalloc(dev, sizeof(int) * temp_val, GFP_KERNEL);
+	if (!linearity_dualx)
+		return -ENOMEM;
+
+	ret = of_property_read_u32_array(np, "atmel,linearity-reg-pos",
+							linearity_reg_pos, temp_val);
+	if (ret) {
+		dev_err(dev, "Unable to get linearity reg pos.\n");
+		return ret;
+	}
+
+	ret = of_property_read_u32_array(np, "atmel,linearity-singlex",
+							linearity_singlex, temp_val);
+	if (ret) {
+		dev_err(dev, "Unable to get linearity singlex.\n");
+		return ret;
+	}
+
+	ret = of_property_read_u32_array(np, "atmel,linearity-dualx",
+							linearity_dualx, temp_val);
+	if (ret) {
+		dev_err(dev, "Unable to get linearity dualx.\n");
+		return ret;
+	}
+
+	pdata->linearity_para_num = temp_val;
+	pdata->linearity_reg_pos = devm_kzalloc(dev, sizeof(u8) * temp_val, GFP_KERNEL);
+	if (!pdata->linearity_reg_pos)
+		return -ENOMEM;
+	pdata->linearity_singlex = devm_kzalloc(dev, sizeof(u8) * temp_val, GFP_KERNEL);
+	if (!pdata->linearity_singlex)
+		return -ENOMEM;
+	pdata->linearity_dualx = devm_kzalloc(dev, sizeof(u8) * temp_val, GFP_KERNEL);
+	if (!pdata->linearity_dualx)
+		return -ENOMEM;
+	for (i = 0; i < temp_val; i++) {
+		pdata->linearity_reg_pos[i] = (u8)linearity_reg_pos[i];
+		pdata->linearity_singlex[i] = (u8)linearity_singlex[i];
+		pdata->linearity_dualx[i] = (u8)linearity_dualx[i];
+	}
 
 	ret = of_property_read_u32(np, "atmel,rx-num", (u32*)&temp_val);
 	if (ret) {
@@ -4103,6 +5350,13 @@ static int mxt_parse_dt(struct device *dev, struct mxt_platform_data *pdata)
 		return ret;
 	} else
 		pdata->tx_num = (u8)temp_val;
+
+	ret = of_property_read_u32(np, "atmel,ref-diff-threshold", (u32*)&temp_val);
+	if (ret) {
+		dev_err(dev, "Unable to get reference diff threshold.\n");
+		return ret;
+	} else
+		pdata->ref_diff_threshold = (u16)temp_val;
 
 	ret = of_property_read_u32(np, "atmel,config-array-size", &pdata->config_array_size);
 	if (ret) {
@@ -4156,12 +5410,12 @@ static int mxt_parse_dt(struct device *dev, struct mxt_platform_data *pdata)
 			return ret;
 		} else
 			info->vendor_id = (u8)temp_val;
-		ret = of_property_read_u32(temp, "atmel,mult-no-touch-threshold", &temp_val);
+		ret = of_property_read_u32(temp, "atmel,lcd-id", &temp_val);
 		if (ret) {
-			dev_err(dev, "Unable to read mult-no-touch-threshold\n");
+			dev_err(dev, "Unable to read lcd id\n");
 			return ret;
 		} else
-			info->mult_no_touch_threshold = temp_val;
+			info->lcd_id = (int)temp_val;
 		ret = of_property_read_u32(temp, "atmel,key-num", &temp_val);
 		if (ret) {
 			dev_err(dev, "Unable to read key num id\n");
@@ -4180,6 +5434,85 @@ static int mxt_parse_dt(struct device *dev, struct mxt_platform_data *pdata)
 				return ret;
 			}
 		}
+
+		ret = of_property_read_u32(temp, "atmel,selfthr-suspend", &temp_val);
+		if (ret) {
+			dev_err(dev, "Unable to read selfthr-suspend\n");
+			return ret;
+		} else
+			info->selfthr_suspend = temp_val;
+		ret = of_property_read_u32(temp, "atmel,selfintthr-stylus", &temp_val);
+		if (ret) {
+			dev_err(dev, "Unable to read selfintthr-stylus\n");
+			return ret;
+		} else
+			info->selfintthr_stylus = temp_val;
+		ret = of_property_read_u32(temp, "atmel,selfintthr-suspend", &temp_val);
+		if (ret) {
+			dev_err(dev, "Unable to read selfintthr-suspend\n");
+			return ret;
+		} else
+			info->selfintthr_suspend = temp_val;
+		ret = of_property_read_u32(temp, "atmel,t71-tchthr-pos", &temp_val);
+		if (ret) {
+			dev_err(dev, "Unable to read t71-glove-ctrl-reg\n");
+			return ret;
+		} else
+			info->t71_tchthr_pos = temp_val;
+		ret = of_property_read_u32(temp, "atmel,self-no-touch-threshold", &temp_val);
+		if (ret) {
+			dev_err(dev, "Unable to read self-no-touch-threshold\n");
+			return ret;
+		} else
+			info->self_no_touch_threshold = temp_val;
+		ret = of_property_read_u32(temp, "atmel,mult-no-touch-threshold", &temp_val);
+		if (ret) {
+			dev_err(dev, "Unable to read mult-no-touch-threshold\n");
+			return ret;
+		} else
+			info->mult_no_touch_threshold = temp_val;
+		ret = of_property_read_u32(temp, "atmel,self-chgtime-min", &temp_val);
+		if (ret) {
+			dev_err(dev, "Unable to read self-chgtime-min\n");
+			return ret;
+		} else
+			info->self_chgtime_min = temp_val;
+		ret = of_property_read_u32(temp, "atmel,self-chgtime-max", &temp_val);
+		if (ret) {
+			dev_err(dev, "Unable to read self-chgtime-max\n");
+			return ret;
+		} else
+			info->self_chgtime_max = temp_val;
+		ret = of_property_read_u32(temp, "atmel,mult-intthr-sensitive", &temp_val);
+		if (ret) {
+			dev_err(dev, "Unable to read mult-intthr-sensitive\n");
+			return ret;
+		} else
+			info->mult_intthr_sensitive = temp_val;
+		ret = of_property_read_u32(temp, "atmel,mult-intthr-not-sensitive", &temp_val);
+		if (ret) {
+			dev_err(dev, "Unable to read mult-intthr-not-sensitive\n");
+			return ret;
+		} else
+			info->mult_intthr_not_sensitive = temp_val;
+		ret = of_property_read_u32(temp, "atmel,atchthr-sensitive", &temp_val);
+		if (ret) {
+			dev_err(dev, "Unable to read mult-intthr-not-sensitive\n");
+			return ret;
+		} else
+			info->atchthr_sensitive = temp_val;
+		ret = of_property_read_u32(temp, "atmel,mult-tchthr-sensitive", &temp_val);
+		if (ret) {
+			dev_err(dev, "Unable to read mult-tchthr-sensitive\n");
+			return ret;
+		} else
+			info->mult_tchthr_sensitive = temp_val;
+		ret = of_property_read_u32(temp, "atmel,mult-tchthr-not-sensitive", &temp_val);
+		if (ret) {
+			dev_err(dev, "Unable to read mult-tchthr-not-sensitive\n");
+			return ret;
+		} else
+			info->mult_tchthr_not_sensitive = temp_val;
 
 		info++;
 	}
@@ -4201,6 +5534,9 @@ static int __devinit mxt_probe(struct i2c_client *client,
 	struct mxt_platform_data *pdata;
 	struct mxt_data *data;
 	int error;
+
+	if (get_hw_version_major() >= 4)
+		return -ENODEV;
 
 	if (client->dev.of_node) {
 		pdata = devm_kzalloc(&client->dev,
@@ -4246,9 +5582,7 @@ static int __devinit mxt_probe(struct i2c_client *client,
 			goto err_free_data;
 		}
 	} else
-		error = mxt_initialize_regulator(data, true);
-		if (error)
-			goto err_free_data;
+		mxt_initialize_regulator(data);
 
 	if (gpio_is_valid(pdata->irq_gpio)) {
 		/* configure touchscreen irq gpio */
@@ -4284,32 +5618,44 @@ static int __devinit mxt_probe(struct i2c_client *client,
 	}
 
 	i2c_set_clientdata(data->client, data);
-	mdelay(10);
+	msleep(10);
 	mxt_wait_for_chg(data);
 
+	data->work_queue = create_workqueue("tp_work_queue");
+	if (data->work_queue != NULL) {
+		dev_info(&client->dev, "Create tp work queue!\n");
+		INIT_DELAYED_WORK(&data->update_setting_delayed_work,
+					mxt_update_setting_delayed_work);
+
+		INIT_DELAYED_WORK(&data->disable_anticalib_delayed_work,
+					mxt_disable_anticalib_delayed_work);
+		INIT_WORK(&data->pre_use_work, mxt_pre_use_work);
+	} else {
+		dev_err(&client->dev, "Fatal error, workqueue can't be created!!!\n");
+		goto err_disable_regulator;
+	}
+	mutex_init(&data->golden_mutex);
 	/* Initialize i2c device */
 	error = mxt_initialize(data);
 	if (error)
 	{
+		pr_err("power gpio = %d\n", (int)gpio_get_value(pdata->power_gpio));
 		pr_err("reset gpio = %d\n", (int)gpio_get_value(pdata->reset_gpio));
 		pr_err("chg gpio = %d\n", (int)gpio_get_value(pdata->irq_gpio));
 
 		if (error != -ENOENT)
-			goto err_reset_gpio_req;
+			goto err_disable_regulator;
 		else {
-			if (0) {
-				error = mxt_update_fw_store(&client->dev, NULL,
-							pdata->mxt_fw_name, strlen(pdata->mxt_fw_name));
-				if (error != strlen(pdata->mxt_fw_name))
-				{
-					dev_err(&client->dev, "Error when update firmware!\n");
-					goto err_disable_regulator;
-				}
+			error = mxt_update_fw_store(&client->dev, NULL,
+						pdata->mxt_fw_name, strlen(pdata->mxt_fw_name));
+			if (error != strlen(pdata->mxt_fw_name))
+			{
+				dev_err(&client->dev, "Error when update firmware!\n");
+				goto err_disable_regulator;
 			}
 		}
 	}
 
-	if (0)
 	mxt_update_fw_by_flag(data);
 
 	error = mxt_initialize_input_device(data);
@@ -4346,6 +5692,16 @@ static int __devinit mxt_probe(struct i2c_client *client,
 
 	mxt_debugfs_init(data);
 
+	data->ignore_tx = kmalloc(sizeof(int) * pdata->tx_num, GFP_KERNEL);
+	if (data->ignore_tx == NULL)
+		goto err_remove_sysfs_group;
+	data->ignore_rx = kmalloc(sizeof(int) * pdata->rx_num, GFP_KERNEL);
+	if (data->ignore_rx == NULL)
+		goto err_remove_sysfs_group;
+
+	queue_work(data->work_queue, &data->pre_use_work);
+	data->init_complete = true;
+
 	return 0;
 
 err_remove_sysfs_group:
@@ -4357,17 +5713,19 @@ err_free_input_device:
 err_free_object:
 	kfree(data->msg_buf);
 	kfree(data->object_table);
+err_disable_regulator:
+	if (gpio_is_valid(pdata->power_gpio)) {
+		gpio_set_value_cansleep(pdata->power_gpio, 0);
+	} else {
+		regulator_disable(data->regulator_avdd);
+		regulator_disable(data->regulator_vdd);
+	}
 err_reset_gpio_req:
 	if (gpio_is_valid(pdata->reset_gpio))
 		gpio_free(pdata->reset_gpio);
 err_irq_gpio_req:
 	if (gpio_is_valid(pdata->irq_gpio))
 		gpio_free(pdata->irq_gpio);
-err_disable_regulator:
-	if (gpio_is_valid(pdata->power_gpio))
-		gpio_set_value_cansleep(pdata->power_gpio, 0);
-	else
-		mxt_initialize_regulator(data, false);
 err_free_power_gpio:
 	if (gpio_is_valid(pdata->power_gpio)) {
 		gpio_free(pdata->power_gpio);
@@ -4382,6 +5740,9 @@ static int __devexit mxt_remove(struct i2c_client *client)
 	struct mxt_data *data = i2c_get_clientdata(client);
 	const struct mxt_platform_data *pdata = data->pdata;
 
+	cancel_delayed_work_sync(&data->update_setting_delayed_work);
+	cancel_delayed_work_sync(&data->disable_anticalib_delayed_work);
+	destroy_workqueue(data->work_queue);
 	sysfs_remove_bin_file(&client->dev.kobj, &data->mem_access_attr);
 	sysfs_remove_group(&client->dev.kobj, &mxt_attr_group);
 	free_irq(data->irq, data);
@@ -4390,10 +5751,12 @@ static int __devexit mxt_remove(struct i2c_client *client)
 	data->msg_buf = NULL;
 	kfree(data->object_table);
 	data->object_table = NULL;
-	if (gpio_is_valid(pdata->power_gpio))
+	if (gpio_is_valid(pdata->power_gpio)) {
 		gpio_set_value_cansleep(pdata->power_gpio, 0);
-	else
-		mxt_initialize_regulator(data, false);
+	} else {
+		regulator_disable(data->regulator_avdd);
+		regulator_disable(data->regulator_vdd);
+	}
 
 	if (gpio_is_valid(pdata->power_gpio))
 		gpio_free(pdata->power_gpio);
@@ -4461,7 +5824,7 @@ late_initcall(mxt_init);
 module_exit(mxt_exit);
 
 /* Module information */
-MODULE_AUTHOR("Lionel Zhang <zhangbo_a@xiaomi.com>");
+MODULE_AUTHOR("Joonyoung Shim <jy0922.shim@samsung.com>");
 MODULE_DESCRIPTION("Atmel maXTouch Touchscreen driver");
 MODULE_LICENSE("GPL");
 
